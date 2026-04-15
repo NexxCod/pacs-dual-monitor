@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "PACS Dual Monitor",
+  "description": "Expande automáticamente el visor PACS en los dos monitores externos",
+  "version": "1.1",
+  "permissions": [
+    "system.display",
+    "tabs",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "https://sjdpacs.synapsetimed.cl/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
