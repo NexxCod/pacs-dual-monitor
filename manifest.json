@@ -1,8 +1,10 @@
 {
   "manifest_version": 3,
   "name": "PACS Dual Monitor",
-  "description": "Expande automáticamente el visor PACS en los dos monitores externos",
-  "version": "1.1",
+  "short_name": "PACS Dual Monitor",
+  "description": "Expande automáticamente el visor de imágenes PACS para cubrir dos monitores externos de diagnóstico.",
+  "version": "1.1.1",
+  "author": "Marcelo Salinas Villagra",
   "permissions": [
     "system.display",
     "tabs",
@@ -16,6 +18,7 @@
   },
   "icons": {
     "48": "icon48.png",
-    "128": "icon128.png"
+    "128": "icon128.png",
+    "16": "icon16.png"
   }
 }

@@ -1,6 +1,10 @@
 const URL_PATTERN = "/ImageViewer/layout";
 const repositionedWindows = new Set();
 
+// Windows has invisible resize borders (~7px on left, right, bottom).
+// If ves un margen residual o la ventana se pasa del borde, ajustar este valor.
+const WINDOWS_INVISIBLE_BORDER = 7;
+
 chrome.webNavigation.onCompleted.addListener(async (details) => {
   if (details.frameId !== 0) return;
 
@@ -34,7 +38,9 @@ async function moveToDualMonitor(tabId, windowId) {
   console.log("[PACS] Displays found:", displays.length);
   displays.forEach((d, i) => {
     console.log(
-      `  [${i}] "${d.name}" primary=${d.isPrimary} bounds=${JSON.stringify(d.bounds)}`
+      `  [${i}] "${d.name}" primary=${d.isPrimary}`,
+      `bounds=${JSON.stringify(d.bounds)}`,
+      `workArea=${JSON.stringify(d.workArea)}`
     );
   });
 
@@ -54,19 +60,31 @@ async function moveToDualMonitor(tabId, windowId) {
 
   const [d1, d2] = externals;
 
-  const left = Math.min(d1.bounds.left, d2.bounds.left);
-  const top = Math.min(d1.bounds.top, d2.bounds.top);
-  const right = Math.max(
-    d1.bounds.left + d1.bounds.width,
-    d2.bounds.left + d2.bounds.width
-  );
-  const bottom = Math.max(
-    d1.bounds.top + d1.bounds.height,
-    d2.bounds.top + d2.bounds.height
-  );
+  // Use workArea instead of bounds to respect the Windows taskbar.
+  // If the taskbar is on the external monitor, workArea excludes it.
+  const wa1 = d1.workArea;
+  const wa2 = d2.workArea;
 
-  const bounds = { left, top, width: right - left, height: bottom - top };
-  console.log("[PACS] Target bounds:", JSON.stringify(bounds));
+  const left = Math.min(wa1.left, wa2.left);
+  const top = Math.min(wa1.top, wa2.top);
+  const right = Math.max(wa1.left + wa1.width, wa2.left + wa2.width);
+  const bottom = Math.max(wa1.top + wa1.height, wa2.top + wa2.height);
+
+  // Compensate for Windows invisible borders:
+  // - Shift left by BORDER so the visible edge aligns with the monitor edge
+  // - Expand width by 2*BORDER (compensate left + right invisible borders)
+  // - Expand height by BORDER (compensate bottom invisible border)
+  // - Top stays the same (no invisible border at top)
+  const B = WINDOWS_INVISIBLE_BORDER;
+  const bounds = {
+    left: left - B,
+    top: top,
+    width: right - left + 2 * B,
+    height: bottom - top + B,
+  };
+
+  console.log("[PACS] Raw workArea span:", JSON.stringify({ left, top, right, bottom }));
+  console.log("[PACS] Target bounds (with border compensation):", JSON.stringify(bounds));
 
   const win = await chrome.windows.get(windowId);
   let targetWindowId = windowId;
@@ -81,30 +99,26 @@ async function moveToDualMonitor(tabId, windowId) {
     await delay(200);
   }
 
-  // Step 1: Ensure normal state (not maximized)
-  console.log("[PACS] Step 1: Setting state to normal...");
+  // Multi-step positioning to bypass Chrome's per-monitor size cap
+  console.log("[PACS] Step 1: state=normal");
   await chrome.windows.update(targetWindowId, { state: "normal" });
   await delay(150);
 
-  // Step 2: Move to the correct position first
-  console.log("[PACS] Step 2: Moving to position...");
+  console.log("[PACS] Step 2: move to position");
   await chrome.windows.update(targetWindowId, {
     left: bounds.left,
     top: bounds.top,
   });
   await delay(150);
 
-  // Step 3: Now resize — Chrome should allow spanning since the
-  // window origin is already on the target monitor
-  console.log("[PACS] Step 3: Resizing to span both monitors...");
+  console.log("[PACS] Step 3: resize to span both monitors");
   await chrome.windows.update(targetWindowId, {
     width: bounds.width,
     height: bounds.height,
   });
   await delay(150);
 
-  // Step 4: Final correction — re-apply everything together
-  console.log("[PACS] Step 4: Final position correction...");
+  console.log("[PACS] Step 4: final correction");
   await chrome.windows.update(targetWindowId, {
     left: bounds.left,
     top: bounds.top,
@@ -112,7 +126,6 @@ async function moveToDualMonitor(tabId, windowId) {
     height: bounds.height,
   });
 
-  // Verify final state
   const finalWin = await chrome.windows.get(targetWindowId);
   console.log("[PACS] Final window state:", JSON.stringify({
     left: finalWin.left,
@@ -121,10 +134,6 @@ async function moveToDualMonitor(tabId, windowId) {
     height: finalWin.height,
   }));
   console.log("[PACS] Expected:", JSON.stringify(bounds));
-
-  if (finalWin.width < bounds.width - 50) {
-    console.warn("[PACS] ⚠️ Chrome capped the width! Got", finalWin.width, "expected", bounds.width);
-  }
 
   repositionedWindows.add(targetWindowId);
   console.log("[PACS] Done!");
