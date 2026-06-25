@@ -1,25 +1,42 @@
 const URL_PATTERN = "/ImageViewer/layout";
 const repositionedWindows = new Set();
 
-// Windows has invisible resize borders (~7px on left, right, bottom).
-// If ves un margen residual o la ventana se pasa del borde, ajustar este valor.
 const WINDOWS_INVISIBLE_BORDER = 7;
 
+// === Config ===
+const CLOSE_ORPHAN_VIEWERS = true;
+const WORKLIST_HINTS = ["/WebQuery", "/Synapse/Web"];
+
+const MIN_DISPLAYS = 3;
+const DISPLAY_RETRY_TRIES = 5;
+const DISPLAY_RETRY_DELAY = 400;
+const VERIFY_TRIES = 3;
+const VERIFY_TOLERANCE_PX = 80;
+const VERIFY_MIN_WIDTH_RATIO = 0.6;
+
+// Synapse redimensiona la ventana DESPUES de que la posicionamos (al terminar
+// de cargar el visor). Estos "settle checks" re-aplican los bounds varias veces
+// en los primeros segundos para ganarle a ese resize tardio.
+// Despues de la ultima revision dejamos de intervenir (para no pelear si el
+// usuario decide redimensionar a mano).
+const SETTLE_CHECKPOINTS_MS = [1000, 2200, 3800, 6000];
+
+// =====================================================================
+// 1) Auto: posicionar cuando se CREA el visor (primera vez)
+// =====================================================================
 chrome.webNavigation.onCompleted.addListener(async (details) => {
   if (details.frameId !== 0) return;
-
   const tab = await chrome.tabs.get(details.tabId);
   if (!tab.url || !tab.url.includes(URL_PATTERN)) return;
 
   if (repositionedWindows.has(tab.windowId)) {
-    console.log("[PACS] Window already repositioned, skipping.");
+    if (CLOSE_ORPHAN_VIEWERS) cleanupOrphanViewers(tab.windowId).catch(() => {});
     return;
   }
-
   console.log(`[PACS] Detected ImageViewer tab: ${details.tabId}, window: ${tab.windowId}`);
-
   try {
     await moveToDualMonitor(details.tabId, tab.windowId);
+    if (CLOSE_ORPHAN_VIEWERS) await cleanupOrphanViewers(tab.windowId);
   } catch (err) {
     console.error("[PACS] Error:", err);
   }
@@ -29,112 +46,211 @@ chrome.windows.onRemoved.addListener((windowId) => {
   repositionedWindows.delete(windowId);
 });
 
+// =====================================================================
+// 2) Manual: forzar reposicionamiento on-demand (atajo Ctrl+Shift+Y o icono)
+// =====================================================================
+chrome.commands.onCommand.addListener((command) => {
+  if (command === "reposition-viewer") repositionViewerNow();
+});
+chrome.action.onClicked.addListener(() => repositionViewerNow());
+
+async function findViewerWindow() {
+  const wins = await chrome.windows.getAll({ populate: true });
+  const candidates = wins.filter((w) =>
+    (w.tabs || []).some((t) => t.url && t.url.includes(URL_PATTERN))
+  );
+  if (candidates.length === 0) return null;
+  const focused = candidates.find((w) => w.focused);
+  if (focused) return focused;
+  candidates.sort((a, b) => b.id - a.id);
+  return candidates[0];
+}
+
+async function repositionViewerNow() {
+  const w = await findViewerWindow();
+  if (!w) {
+    console.warn("[PACS] No encontre ventana del visor (/ImageViewer/layout) para reposicionar.");
+    return;
+  }
+  const viewerTab = (w.tabs || []).find((t) => t.url && t.url.includes(URL_PATTERN));
+  console.log(`[PACS] Reposicion MANUAL de window ${w.id}.`);
+  repositionedWindows.delete(w.id);
+  try {
+    await moveToDualMonitor(viewerTab.id, w.id);
+  } catch (e) {
+    console.error("[PACS] Error en reposicion manual:", e);
+  }
+}
+
+// =====================================================================
+// 3) Mensajes del content script (lanzadera pegada)
+// =====================================================================
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (!msg || !sender.tab) return;
+  if (msg.type === "launcher-stuck") {
+    const wid = sender.tab.windowId;
+    chrome.windows.get(wid, { populate: true }, (w) => {
+      const tabs = (w && w.tabs) || [];
+      const onlyLauncher =
+        tabs.length === 1 &&
+        tabs[0].url &&
+        tabs[0].url.includes("winpass=true") &&
+        tabs[0].url.includes("/WebQuery/Index");
+      if (onlyLauncher) {
+        console.log(`[PACS] Cerrando lanzadera pegada (window ${wid}).`);
+        chrome.windows.remove(wid).catch((e) => console.warn("[PACS]", e));
+      } else {
+        console.log(`[PACS] Lanzadera pegada pero la ventana ${wid} tiene mas tabs; no se cierra por seguridad.`);
+      }
+    });
+  }
+});
+
+// =====================================================================
+// Helpers
+// =====================================================================
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function getDisplaysWithRetry() {
+  let displays = await chrome.system.display.getInfo();
+  let attempt = 1;
+  while (displays.length < MIN_DISPLAYS && attempt < DISPLAY_RETRY_TRIES) {
+    console.log(`[PACS] Solo ${displays.length} monitores, reintentando (${attempt}/${DISPLAY_RETRY_TRIES})...`);
+    await delay(DISPLAY_RETRY_DELAY);
+    displays = await chrome.system.display.getInfo();
+    attempt++;
+  }
+  return displays;
+}
+
+async function cleanupOrphanViewers(keepWindowId) {
+  const wins = await chrome.windows.getAll({ populate: true });
+  for (const w of wins) {
+    if (w.id === keepWindowId) continue;
+    const tabs = w.tabs || [];
+    const hasViewer = tabs.some((t) => t.url && t.url.includes(URL_PATTERN));
+    if (!hasViewer) continue;
+    const isWorklist = tabs.some(
+      (t) => t.url && WORKLIST_HINTS.some((h) => t.url.includes(h))
+    );
+    if (isWorklist) {
+      console.log(`[PACS] Window ${w.id} tiene worklist, no se cierra.`);
+      continue;
+    }
+    console.log(`[PACS] Cerrando viewer huerfano: window ${w.id}`);
+    try {
+      await chrome.windows.remove(w.id);
+      repositionedWindows.delete(w.id);
+    } catch (e) {
+      console.warn(`[PACS] No pude cerrar window ${w.id}:`, e);
+    }
+  }
+}
+
+function boundsOK(win, bounds) {
+  const widthOK = win.width >= bounds.width * VERIFY_MIN_WIDTH_RATIO;
+  const posOK =
+    Math.abs(win.left - bounds.left) <= VERIFY_TOLERANCE_PX &&
+    Math.abs(win.top - bounds.top) <= VERIFY_TOLERANCE_PX;
+  return widthOK && posOK;
+}
+
+async function applyBounds(windowId, bounds) {
+  await chrome.windows.update(windowId, { state: "normal" });
+  await delay(150);
+  await chrome.windows.update(windowId, { left: bounds.left, top: bounds.top });
+  await delay(150);
+  await chrome.windows.update(windowId, { width: bounds.width, height: bounds.height });
+  await delay(150);
+  await chrome.windows.update(windowId, {
+    left: bounds.left, top: bounds.top, width: bounds.width, height: bounds.height,
+  });
+  await delay(150);
+  return chrome.windows.get(windowId);
+}
+
+// Re-aplica los bounds en varios momentos para ganarle al resize tardio de Synapse.
+function scheduleSettleChecks(windowId, bounds) {
+  SETTLE_CHECKPOINTS_MS.forEach((ms) => {
+    setTimeout(async () => {
+      try {
+        const w = await chrome.windows.get(windowId);
+        if (!w) return;
+        if (boundsOK(w, bounds)) {
+          console.log(`[PACS] Settle ${ms}ms: OK (w=${w.width}), sin cambios.`);
+          return;
+        }
+        console.log(`[PACS] Settle ${ms}ms: Synapse la movio (w=${w.width}), re-aplicando bounds.`);
+        await applyBounds(windowId, bounds);
+      } catch (e) {
+        // ventana cerrada / inexistente: ignorar
+      }
+    }, ms);
+  });
+}
+
 async function moveToDualMonitor(tabId, windowId) {
-  const displays = await chrome.system.display.getInfo();
+  const displays = await getDisplaysWithRetry();
   console.log("[PACS] Displays found:", displays.length);
   displays.forEach((d, i) => {
-    console.log(
-      `  [${i}] "${d.name}" primary=${d.isPrimary}`,
-      `bounds=${JSON.stringify(d.bounds)}`,
-      `workArea=${JSON.stringify(d.workArea)}`
-    );
+    console.log(`  [${i}] "${d.name}" primary=${d.isPrimary}`,
+      `bounds=${JSON.stringify(d.bounds)}`, `workArea=${JSON.stringify(d.workArea)}`);
   });
 
-  if (displays.length < 3) {
-    console.warn("[PACS] Need at least 3 monitors.");
+  if (displays.length < MIN_DISPLAYS) {
+    console.warn(`[PACS] Tras reintentos sigo viendo ${displays.length} monitores (esperaba ${MIN_DISPLAYS}). No reposiciono.`);
     return;
   }
 
   let externals = displays.filter((d) => !d.isPrimary);
   if (externals.length < 2) {
     const sorted = [...displays].sort(
-      (a, b) =>
-        b.bounds.width * b.bounds.height - a.bounds.width * a.bounds.height
+      (a, b) => b.bounds.width * b.bounds.height - a.bounds.width * a.bounds.height
     );
     externals = [sorted[0], sorted[1]];
   }
 
   const [d1, d2] = externals;
-
-  // Use workArea instead of bounds to respect the Windows taskbar.
-  // If the taskbar is on the external monitor, workArea excludes it.
   const wa1 = d1.workArea;
   const wa2 = d2.workArea;
-
   const left = Math.min(wa1.left, wa2.left);
   const top = Math.min(wa1.top, wa2.top);
   const right = Math.max(wa1.left + wa1.width, wa2.left + wa2.width);
   const bottom = Math.max(wa1.top + wa1.height, wa2.top + wa2.height);
 
-  // Compensate for Windows invisible borders:
-  // - Shift left by BORDER so the visible edge aligns with the monitor edge
-  // - Expand width by 2*BORDER (compensate left + right invisible borders)
-  // - Expand height by BORDER (compensate bottom invisible border)
-  // - Top stays the same (no invisible border at top)
   const B = WINDOWS_INVISIBLE_BORDER;
   const bounds = {
-    left: left - B,
-    top: top,
-    width: right - left + 2 * B,
-    height: bottom - top + B,
+    left: left - B, top: top, width: right - left + 2 * B, height: bottom - top + B,
   };
-
-  console.log("[PACS] Raw workArea span:", JSON.stringify({ left, top, right, bottom }));
-  console.log("[PACS] Target bounds (with border compensation):", JSON.stringify(bounds));
+  console.log("[PACS] Target bounds:", JSON.stringify(bounds));
 
   const win = await chrome.windows.get(windowId);
   let targetWindowId = windowId;
-
   if (win.type !== "popup") {
     console.log("[PACS] Creating new popup window...");
-    const newWindow = await chrome.windows.create({
-      tabId: tabId,
-      type: "popup",
-    });
+    const newWindow = await chrome.windows.create({ tabId: tabId, type: "popup" });
     targetWindowId = newWindow.id;
     await delay(200);
   }
 
-  // Multi-step positioning to bypass Chrome's per-monitor size cap
-  console.log("[PACS] Step 1: state=normal");
-  await chrome.windows.update(targetWindowId, { state: "normal" });
-  await delay(150);
+  let finalWin = await applyBounds(targetWindowId, bounds);
+  for (let i = 1; i <= VERIFY_TRIES; i++) {
+    if (boundsOK(finalWin, bounds)) { console.log(`[PACS] Ventana OK al intento ${i}.`); break; }
+    console.warn(`[PACS] Ventana no quedo bien (intento ${i}/${VERIFY_TRIES}). Reintentando.`,
+      JSON.stringify({ got: { l: finalWin.left, t: finalWin.top, w: finalWin.width, h: finalWin.height }, want: bounds }));
+    await delay(250);
+    finalWin = await applyBounds(targetWindowId, bounds);
+  }
 
-  console.log("[PACS] Step 2: move to position");
-  await chrome.windows.update(targetWindowId, {
-    left: bounds.left,
-    top: bounds.top,
-  });
-  await delay(150);
-
-  console.log("[PACS] Step 3: resize to span both monitors");
-  await chrome.windows.update(targetWindowId, {
-    width: bounds.width,
-    height: bounds.height,
-  });
-  await delay(150);
-
-  console.log("[PACS] Step 4: final correction");
-  await chrome.windows.update(targetWindowId, {
-    left: bounds.left,
-    top: bounds.top,
-    width: bounds.width,
-    height: bounds.height,
-  });
-
-  const finalWin = await chrome.windows.get(targetWindowId);
-  console.log("[PACS] Final window state:", JSON.stringify({
-    left: finalWin.left,
-    top: finalWin.top,
-    width: finalWin.width,
-    height: finalWin.height,
+  console.log("[PACS] Final:", JSON.stringify({
+    left: finalWin.left, top: finalWin.top, width: finalWin.width, height: finalWin.height,
   }));
-  console.log("[PACS] Expected:", JSON.stringify(bounds));
+
+  // Defensa contra el resize tardio de Synapse.
+  scheduleSettleChecks(targetWindowId, bounds);
 
   repositionedWindows.add(targetWindowId);
-  console.log("[PACS] Done!");
+  console.log("[PACS] Done (settle checks programados).");
 }
