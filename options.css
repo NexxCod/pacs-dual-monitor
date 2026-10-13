@@ -53,6 +53,7 @@ th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line
 th { color: var(--muted); font-weight: 600; }
 tr.chosen td { background: color-mix(in srgb, var(--accent) 10%, transparent); }
 .target { margin: 12px 0 0; font-weight: 600; }
+.insets { margin: 6px 0 0; color: var(--muted); font-size: 13px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .warnings { margin: 8px 0 0; padding-left: 18px; color: var(--warn); }
 .cards { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); margin-bottom: 10px; }
 .card { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 13px; }

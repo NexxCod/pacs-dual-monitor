@@ -97,6 +97,14 @@
     $("#pick-warnings").replaceChildren(...((st.pick && st.pick.warnings) || []).map((w) => h("li", {}, w)));
   }
 
+  function renderInsets(st) {
+    const i = st.insets || {};
+    const l = st.learnedInsets;
+    $("#insets").textContent =
+      `Bordes de la ventana compensados: izquierda ${i.left} · derecha ${i.right} · abajo ${i.bottom} px — ` +
+      (l ? `medidos en este equipo (${new Date(l.at).toLocaleString("es-CL")})` : "valores iniciales, se miden al mover el mouse sobre el visor");
+  }
+
   function renderManaged(st) {
     const cards = st.managed.map((m) => {
       const delta =
@@ -119,12 +127,26 @@
         h("div", {}, "Destino: ", m.target ? rect(m.target.bounds) : "—"),
         delta == null ? null : h("div", { class: delta <= 3 ? "ok" : "warn" }, delta <= 3 ? "✓ En su lugar" : `Desfase de ${delta}px`),
         h("div", { class: dprOk ? "" : "error" }, "Escala del visor (devicePixelRatio): ", rep.dpr == null ? "sin informe aún" : pct(rep.dpr)),
+        viewportLine(m.viewport),
         h("div", { class: zoomOk ? "" : "error" }, "Zoom: ", m.zoom == null ? "—" : pct(m.zoom)),
         rep.blockedCalls ? h("div", { class: "muted" }, `Intentos de Synapse de mover la ventana bloqueados: ${rep.blockedCalls}`) : null,
         m.autoReloads ? h("div", { class: "warn" }, `Recargas automáticas en este estudio: ${m.autoReloads}`) : null
       );
     });
     $("#managed").replaceChildren(...(cards.length ? cards : [h("p", { class: "muted" }, "No hay ningún visor abierto.")]));
+  }
+
+  // Area de la pagina del visor medida en la pantalla (con el mouse).
+  function viewportLine(v) {
+    if (!v || !v.over) return h("div", { class: "muted" }, "Área del visor en pantalla: se mide al mover el mouse sobre el visor");
+    const o = v.over;
+    const out = [];
+    if (o.bottom > 0) out.push(`${o.bottom} px abajo`);
+    if (o.left > 0) out.push(`${o.left} px a la izquierda`);
+    if (o.right > 0) out.push(`${o.right} px a la derecha`);
+    return out.length
+      ? h("div", { class: "warn" }, "Área del visor: se pasaba de la pantalla (" + out.join(", ") + ")")
+      : h("div", { class: "ok" }, "✓ Área del visor dentro de la pantalla");
   }
 
   function renderLaunches(st) {
@@ -176,6 +198,7 @@
     $("#version").textContent = "v" + st.version;
     renderAlerts(st);
     renderDisplays(st);
+    renderInsets(st);
     renderManaged(st);
     renderLaunches(st);
     renderLog(st);
@@ -230,6 +253,13 @@
     refresh();
   });
 
+  $("#btn-remeasure").addEventListener("click", async () => {
+    await chrome.runtime.sendMessage({ type: "pacs-dm:remeasure" }).catch(() => null);
+    flash("#save-msg", "Los bordes se volverán a medir con el próximo visor.");
+    lastDisplaysSig = "";
+    refresh();
+  });
+
   $("#btn-copy").addEventListener("click", async () => {
     const st = last || (await getStatus());
     const diag = {
@@ -239,6 +269,7 @@
       opciones: st.settings,
       monitores: st.displays,
       eleccion: st.pick,
+      bordes: { usados: st.insets, medidos: st.learnedInsets },
       visores: st.managed,
       lanzamientos: st.launches,
       alertas: st.alerts,

@@ -303,7 +303,63 @@
       true
     );
     window.addEventListener("pointerdown", markInput, { capture: true, passive: true });
+    window.addEventListener("mousemove", measureViewport, { capture: true, passive: true });
     watchWebgl();
+  }
+
+  // Donde quedo DE VERDAD el area de la pagina del visor en la pantalla. Un
+  // movimiento real del mouse trae ambas coordenadas: screenX - clientX es el
+  // borde izquierdo del area en la pantalla (y lo mismo arriba). El
+  // background lo compara con la pantalla y corrige si el visor se pasa del
+  // borde (p.ej. hacia abajo).
+  let vpKey = "";
+  let vpAt = 0;
+  function measureViewport(e) {
+    if (!e.isTrusted) return;
+    const now = Date.now();
+    if (now - vpAt < 1500) return;
+    const r = viewportInScreen(e);
+    // Descarta eventos con coordenadas incoherentes (p.ej. el que Chrome
+    // genera cuando la ventana aparece o se mueve bajo el puntero) sin gastar
+    // el turno: el area de la pagina tiene que estar dentro de la ventana.
+    const top = window.top;
+    if (
+      !r ||
+      r.left < top.screenX - 2 ||
+      r.left > top.screenX + 60 ||
+      r.top < top.screenY - 2 ||
+      r.top > top.screenY + 300
+    ) {
+      return;
+    }
+    vpAt = now;
+    const key = [r.left, r.top, r.width, r.height].join(",");
+    if (key === vpKey) return;
+    vpKey = key;
+    send({ type: "pacs-dm:viewport", rect: r, dpr: window.devicePixelRatio, hasInput: inputAt > 0 });
+  }
+
+  // Area de la pagina principal en coordenadas de pantalla. Si el evento llega
+  // a un iframe (del mismo origen), se suma la posicion de cada iframe.
+  function viewportInScreen(e) {
+    let x = e.screenX - e.clientX;
+    let y = e.screenY - e.clientY;
+    let w = window;
+    try {
+      while (w !== w.top) {
+        const fe = w.frameElement;
+        if (!fe) return null; // iframe de otro origen
+        const parent = w.parent;
+        const rect = fe.getBoundingClientRect();
+        const cs = parent.getComputedStyle(fe);
+        x -= rect.left + (parseFloat(cs.borderLeftWidth) || 0) + (parseFloat(cs.paddingLeft) || 0);
+        y -= rect.top + (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.paddingTop) || 0);
+        w = parent;
+      }
+      return { left: Math.round(x), top: Math.round(y), width: w.innerWidth, height: w.innerHeight };
+    } catch (err) {
+      return null;
+    }
   }
 
   // Pantalla negra: el visor perdio el contexto grafico y no lo recupero

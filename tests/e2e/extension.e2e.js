@@ -12,8 +12,24 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { execFileSync } = require("node:child_process");
 const { chromium } = require("playwright");
 const mock = require("./mock-synapse.js");
+
+// Mouse real del servidor X (python-xlib): los eventos de Playwright no traen
+// coordenadas de pantalla reales. Sin python-xlib, la prueba U se omite.
+const PY = process.env.PACS_PYTHON || "python3";
+function hasXmove() {
+  try {
+    execFileSync(PY, ["-c", "import Xlib.ext.xtest"], { stdio: "ignore" });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+function xmove(x, y) {
+  execFileSync(PY, [path.join(__dirname, "xmove.py"), String(x), String(y)]);
+}
 
 const EXT = path.resolve(__dirname, "..", "..");
 const ORIGIN = "https://sjdpacs.synapsetimed.cl";
@@ -181,6 +197,8 @@ async function resetWorld() {
     state.warned = {};
     state.alerts = {};
     saveState();
+    learnedInsets = null;
+    await chrome.storage.local.remove("frameInsets");
     await clearLog();
   });
   await setSettings();
@@ -645,6 +663,68 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 6000
     assert.match(await opt.locator("#target").innerText(), /1920, 0 · 3840×1080/);
     assert.ok((await opt.locator("#log li").count()) > 0);
     await opt.close();
+  });
+
+  it("U) bordes: con el mouse real mide dónde quedó el visor y corrige si se pasa de la pantalla (lados y abajo)", async (t) => {
+    if (!hasXmove()) return t.skip("requiere python-xlib (PACS_PYTHON)");
+    xmove(100, 1150); // puntero fuera de las ventanas mientras aparecen
+    await setSettings({ invisibleBorder: 7 });
+    // 1) Lados: aquí (Linux sin gestor de ventanas) la ventana no tiene borde
+    //    invisible, así que compensar 7 px deja el visor 7 px fuera de cada
+    //    lado. Se mide (al activarse la ventana o al mover el mouse) y se corrige.
+    await worklist.evaluate(() => window.openStudy("U1", "popup"));
+    const page = await waitViewer("U1");
+    await sleep(1600);
+    xmove(3000, 600);
+    await sleep(100);
+    xmove(3020, 620);
+    await waitFor(async () => /Bordes ajustados: el visor se pasaba 7 px a la izquierda, 7 px a la derecha/.test(await logText()), {
+      what: "ajuste de los lados",
+    });
+    await waitFor(async () => near((await viewerWindow(page)).bounds, TARGET), { what: "ventana corregida" });
+    const learned = await swEval(() => learnedInsets);
+    assert.deepEqual([learned.left, learned.right, learned.bottom], [0, 0, 0]);
+
+    // 2) Abajo: bordes como los de la v2.0.0 (7 px abajo) -> se pasaba hacia abajo.
+    await swEval(() => saveLearnedInsets({ left: 0, right: 0, bottom: 7 }));
+    await page.close();
+    xmove(100, 1150);
+    await worklist.evaluate(() => window.openStudy("U2", "popup"));
+    const page2 = await waitViewer("U2");
+    await sleep(1600);
+    xmove(3100, 500);
+    await sleep(100);
+    xmove(3120, 520);
+    await waitFor(async () => /Bordes ajustados: el visor se pasaba 7 px hacia abajo/.test(await logText()), { what: "ajuste de abajo" });
+    await waitFor(async () => near((await viewerWindow(page2)).bounds, TARGET), { what: "ventana corregida abajo" });
+
+    // 3) Visor ya en uso: no se redimensiona solo; queda corregido para el
+    //    próximo estudio y Ctrl+Shift+Y lo ajusta. (Medición controlada.)
+    await page2.close();
+    xmove(100, 1150);
+    await worklist.evaluate(() => window.openStudy("U3", "popup"));
+    const page3 = await waitViewer("U3");
+    const w3 = await viewerWindow(page3);
+    const tall = { left: TARGET.left, top: TARGET.top, width: TARGET.width, height: TARGET.height + 7 };
+    await swEval(
+      async ([tabId, windowId, b]) => {
+        const rec = state.managed[tabId];
+        upsertManaged(tabId, { target: Object.assign({}, rec.target, { bounds: b }) });
+        await applyBounds(windowId, b, "prueba");
+      },
+      [w3.tabId, w3.windowId, tall]
+    );
+    await page3.mouse.click(600, 400); // uso
+    await waitFor(async () => (await swEval((id) => state.managed[id].inputAt || 0, w3.tabId)) > 0, { what: "uso registrado" });
+    const m = await page3.evaluate(() => ({ iw: innerWidth, ih: innerHeight, oh: outerHeight }));
+    const rect = { left: tall.left, top: tall.top + (m.oh - m.ih), width: m.iw, height: m.ih };
+    await swEval(([tabId, windowId, r]) => onViewportMeasured(tabId, { rect: r, hasInput: true }, { tab: { windowId } }), [w3.tabId, w3.windowId, rect]);
+    assert.match(await logText(), /Bordes ajustados: el visor se pasaba 7 px hacia abajo[\s\S]*Bordes ajustados: el visor se pasaba 7 px hacia abajo/);
+    await sleep(300);
+    assert.equal((await viewerWindow(page3)).bounds.height, TARGET.height + 7, "un visor en uso no se redimensiona solo");
+    const r = await swEval(() => repositionViewerNow("prueba"));
+    assert.equal(r.ok, true);
+    assert.ok(near((await viewerWindow(page3)).bounds, TARGET));
   });
 
   it("T) reinyección al instalar/actualizar con Synapse abierto: no duplica y reemplaza instancias desconectadas", async () => {

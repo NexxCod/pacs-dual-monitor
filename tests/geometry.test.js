@@ -172,6 +172,39 @@ test("sin dato de pantalla interna y principal externa: abarca los dos externos 
   assert.deepEqual(ids(G.pickViewerDisplays([e1, e2, nb])), ["1", "2"]);
 });
 
+test("bordes por lado: abajo puede ser distinto de los lados", () => {
+  const nb = disp(1, 0, 0, 1280, 720, { isPrimary: true, isInternal: true });
+  const e1 = disp(2, 1280, 0, 1920, 1080);
+  const e2 = disp(3, 3200, 0, 1920, 1080);
+  const list = G.pickViewerDisplays([nb, e1, e2]).displays;
+  const area = G.visibleArea(list);
+  assert.deepEqual(area, { left: 1280, top: 0, right: 5120, bottom: 1080 });
+  assert.deepEqual(G.targetBounds(list, { left: 7, right: 7, bottom: 0 }), { left: 1273, top: 0, width: 3854, height: 1080 });
+  assert.deepEqual(G.insetsOf({ left: 1273, top: 0, width: 3854, height: 1087 }, area), { left: 7, right: 7, bottom: 7 });
+});
+
+test("medición: el visor se pasaba 7 px hacia abajo -> borde inferior 0", () => {
+  const area = { left: 1280, top: 0, right: 5120, bottom: 1040 };
+  // Lados con borde invisible (el área de la página calza), abajo sin borde
+  // invisible: la página llega 7 px más abajo que la pantalla.
+  const vp = { left: 1280, top: 72, width: 3840, height: 1040 - 72 + 7 };
+  const r = G.correctInsets(area, vp, { left: 7, right: 7, bottom: 7 });
+  assert.deepEqual(r.over, { left: 0, right: 0, bottom: 7 });
+  assert.deepEqual(r.insets, { left: 7, right: 7, bottom: 0 });
+  assert.equal(r.changed, true);
+});
+
+test("medición: un hueco se rellena dejando 1 px; dentro de tolerancia no cambia", () => {
+  const area = { left: 1280, top: 0, right: 5120, bottom: 1040 };
+  const gap = G.correctInsets(area, { left: 1281, top: 72, width: 3838, height: 1040 - 72 - 8 }, { left: 7, right: 7, bottom: 0 });
+  assert.deepEqual(gap.over, { left: -1, right: -1, bottom: -8 });
+  assert.deepEqual(gap.insets, { left: 7, right: 7, bottom: 7 });
+  const ok = G.correctInsets(area, { left: 1280, top: 72, width: 3840, height: 968 }, { left: 7, right: 7, bottom: 0 });
+  assert.equal(ok.changed, false);
+  const sides = G.correctInsets(area, { left: 1273, top: 72, width: 3854, height: 968 }, { left: 7, right: 7, bottom: 0 });
+  assert.deepEqual(sides.insets, { left: 0, right: 0, bottom: 0 });
+});
+
 test("boundsDelta y centerInside", () => {
   const t = { left: 1273, top: 0, width: 3854, height: 1087 };
   assert.equal(G.boundsDelta({ left: 1273, top: 0, width: 3854, height: 1087 }, t), 0);

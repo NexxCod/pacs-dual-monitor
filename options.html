@@ -33,6 +33,7 @@
     </div>
     <p class="hint">Si no marcas ninguno, la extensión elige sola los dos monitores externos (iguales y contiguos, que no sean el notebook).</p>
     <p id="target" class="target"></p>
+    <p class="insets"><span id="insets"></span> <button type="button" id="btn-remeasure">Volver a medir los bordes</button></p>
     <ul id="pick-warnings" class="warnings"></ul>
   </section>
 
@@ -59,7 +60,7 @@
         <label><input type="checkbox" name="forceZoom100"> Mantener el zoom de Synapse en 100% y bloquear Ctrl+rueda / Ctrl+ / Ctrl− en el visor <span class="tag">Synapse lo exige</span></label>
         <label><input type="checkbox" name="autoReload"> Recargar el visor solo si quedó en negro o cambió de escala después de abrir el estudio (solo si aún no lo usaste; si no, te avisa)</label>
         <label><input type="checkbox" name="singleMonitorFallback"> Si hay un solo monitor externo, usarlo solo</label>
-        <label class="inline">Borde invisible de Windows <input type="number" name="invisibleBorder" min="0" max="20" step="1"> px</label>
+        <label class="inline">Borde invisible de Windows (lados, valor inicial) <input type="number" name="invisibleBorder" min="0" max="20" step="1"> px</label>
         <label class="inline">Guardia tras cargar el visor <input type="number" name="guardSeconds" min="0" max="60" step="1"> s</label>
       </fieldset>
       <fieldset>

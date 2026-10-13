@@ -71,14 +71,17 @@ const T = {
 // =====================================================================
 const state = { managed: {}, launches: {}, warned: {}, alerts: {} };
 let settings = Object.assign({}, DEFAULT_SETTINGS);
+// Bordes de la ventana medidos en este equipo ({left, right, bottom, at}).
+let learnedInsets = null;
 
 const ready = (async () => {
   try {
     const [loc, ses] = await Promise.all([
-      chrome.storage.local.get(["settings"]),
+      chrome.storage.local.get(["settings", "frameInsets"]),
       chrome.storage.session.get(["managed", "launches", "warned", "alerts"]),
     ]);
     settings = Object.assign({}, DEFAULT_SETTINGS, loc.settings || {});
+    learnedInsets = loc.frameInsets || null;
     state.managed = ses.managed || {};
     state.launches = ses.launches || {};
     state.warned = ses.warned || {};
@@ -99,12 +102,35 @@ function saveState() {
 }
 
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === "local" && changes.settings) {
+  if (area !== "local") return;
+  if (changes.settings) {
+    const before = (changes.settings.oldValue || {}).invisibleBorder;
     settings = Object.assign({}, DEFAULT_SETTINGS, changes.settings.newValue || {});
     displayCache = null;
     log("info", "Opciones actualizadas.");
+    // Si cambias el borde a mano, se vuelve a medir desde ese valor.
+    if (before !== undefined && before !== settings.invisibleBorder && learnedInsets) {
+      learnedInsets = null;
+      chrome.storage.local.remove("frameInsets").catch(() => {});
+    }
   }
+  if (changes.frameInsets) learnedInsets = changes.frameInsets.newValue || null;
 });
+
+// Bordes que se compensan al ubicar la ventana. Los lados parten del valor de
+// Opciones (borde invisible de Windows); abajo parte en 0 porque si sobra, la
+// ventana se pasa de la pantalla y tapa parte del visor (y si falta, solo
+// queda un hueco). Luego se usan los bordes medidos en este equipo.
+function effectiveInsets() {
+  if (learnedInsets) return G.normalizeInsets(learnedInsets);
+  const b = G.normalizeInsets(settings.invisibleBorder).left;
+  return { left: b, right: b, bottom: 0 };
+}
+
+async function saveLearnedInsets(insets) {
+  learnedInsets = Object.assign(G.normalizeInsets(insets), { at: Date.now() });
+  await chrome.storage.local.set({ frameInsets: learnedInsets }).catch(() => {});
+}
 
 // =====================================================================
 // Registro (consola + pagina de Opciones)
@@ -334,8 +360,11 @@ async function computeTarget() {
     return null;
   }
   lastGoodDisplayCount = Math.max(lastGoodDisplayCount, displays.length);
+  const insets = effectiveInsets();
   return {
-    bounds: G.targetBounds(pick.displays, settings.invisibleBorder),
+    bounds: G.targetBounds(pick.displays, insets),
+    area: G.visibleArea(pick.displays),
+    insets,
     displayIds: pick.displays.map((d) => d.id),
     names: pick.displays.map((d) => d.name || d.id),
     scales: pick.displays.map(G.displayScale),
@@ -376,7 +405,14 @@ async function onDisplaysSettled() {
 }
 
 function targetInfo(target) {
-  return { bounds: target.bounds, displayIds: target.displayIds, names: target.names, scales: target.scales };
+  return {
+    bounds: target.bounds,
+    area: target.area,
+    insets: target.insets,
+    displayIds: target.displayIds,
+    names: target.names,
+    scales: target.scales,
+  };
 }
 
 // Ubica una pestana de visor ya abierta (sin tocar sus datos de navegacion):
@@ -1184,6 +1220,84 @@ async function onViewerReport(tabId, rep, sender) {
 }
 
 // =====================================================================
+// Bordes: que el area del visor calce exacto con la pantalla
+// =====================================================================
+// El content script mide con el mouse (screenX - clientX) donde quedo de
+// verdad el area de la pagina del visor en la pantalla. Si se pasa del area
+// visible (p.ej. hacia abajo, debajo del borde de la pantalla) o deja un
+// hueco, se corrigen los bordes, se guardan para los proximos estudios y, si
+// aun no usaste el visor, se ajusta de inmediato.
+function describeOver(over) {
+  const parts = [];
+  if (over.bottom > 0) parts.push(`${over.bottom} px hacia abajo`);
+  if (over.left > 0) parts.push(`${over.left} px a la izquierda`);
+  if (over.right > 0) parts.push(`${over.right} px a la derecha`);
+  return parts.length ? `se pasaba ${parts.join(", ")} de la pantalla` : "dejaba un hueco en el borde";
+}
+
+async function onViewportMeasured(tabId, msg, sender) {
+  const rec = state.managed[tabId];
+  const vp = msg.rect;
+  if (!rec || !rec.target || !rec.target.area || !settings.placeViewer) return;
+  if (!vp || ![vp.left, vp.top, vp.width, vp.height].every(Number.isFinite)) return;
+  const w = await chrome.windows.get(sender.tab.windowId).catch(() => null);
+  if (!w || w.type !== "popup" || w.state !== "normal") return;
+  // Solo con la ventana donde la pusimos y con zoom 100% (px de la pagina = px de pantalla).
+  if (G.boundsDelta(w, rec.target.bounds) > T.exactPx) return;
+  const zoom = await chrome.tabs.getZoom(tabId).catch(() => 1);
+  if (Math.abs(zoom - 1) > 0.005) return;
+  // Plausibilidad: el area de la pagina tiene que estar dentro de la ventana.
+  const plausible =
+    vp.left >= w.left - 2 &&
+    vp.top >= w.top - 2 &&
+    vp.left + vp.width <= w.left + w.width + 2 &&
+    vp.top + vp.height <= w.top + w.height + 2 &&
+    vp.width >= w.width - 100 &&
+    vp.height >= w.height - 300;
+  if (!plausible) {
+    if (!rec.badViewport) {
+      upsertManaged(tabId, { badViewport: true });
+      log("info", "Medición del área del visor descartada (no es plausible).", { area: vp, ventana: box(w) });
+    }
+    return;
+  }
+  const area = rec.target.area;
+  const cur = G.insetsOf(rec.target.bounds, area);
+  const res = G.correctInsets(area, vp, cur);
+  upsertManaged(tabId, { viewport: { rect: vp, over: res.over, at: Date.now() } });
+  if (!res.changed) {
+    // Calza: se guardan estos bordes como medidos (si aun no lo estaban).
+    const l = learnedInsets;
+    if (!l || l.left !== cur.left || l.right !== cur.right || l.bottom !== cur.bottom) {
+      await saveLearnedInsets(cur);
+      log("info", "Bordes de la ventana verificados: el visor calza exacto con la pantalla.", cur);
+    }
+    return;
+  }
+  if (Math.max(Math.abs(res.over.left), Math.abs(res.over.right), Math.abs(res.over.bottom)) > 40) {
+    log("info", "Medición del área del visor fuera de rango; no se ajusta.", { sobrepasa: res.over, area: vp, ventana: box(w) });
+    return;
+  }
+  await saveLearnedInsets(res.insets);
+  const b = rec.target.bounds;
+  const d = { left: res.insets.left - cur.left, right: res.insets.right - cur.right, bottom: res.insets.bottom - cur.bottom };
+  const nb = { left: b.left - d.left, top: b.top, width: b.width + d.left + d.right, height: b.height + d.bottom };
+  const why = describeOver(res.over);
+  log("info", `Bordes ajustados: el visor ${why}.`, { sobrepasa: res.over, bordes: res.insets });
+  const inUse = !!msg.hasInput || (rec.inputAt || 0) > (rec.navAt || 0);
+  if (!inUse) {
+    upsertManaged(tabId, { target: Object.assign({}, rec.target, { bounds: nb, insets: res.insets }) });
+    await applyBounds(w.id, nb, "ajuste de bordes");
+  } else {
+    noticeTab(tabId, "warn", `El visor ${why}. Quedó corregido para los próximos estudios; para ajustarlo ahora usa el botón (o Ctrl+Shift+Y).`, {
+      sticky: true,
+      key: "insets",
+      actions: [{ id: "reposition", label: "Ajustar ahora" }],
+    });
+  }
+}
+
+// =====================================================================
 // Reubicacion manual (atajo Ctrl+Shift+Y o click en el icono)
 // =====================================================================
 chrome.commands.onCommand.addListener((command) => {
@@ -1300,6 +1414,14 @@ async function handleMessage(msg, sender) {
     case "pacs-dm:viewer-health":
       if (tabId != null) await onViewerHealth(tabId, msg);
       return;
+    case "pacs-dm:viewport":
+      if (tabId != null) await onViewportMeasured(tabId, msg, sender);
+      return;
+    case "pacs-dm:remeasure":
+      learnedInsets = null;
+      await chrome.storage.local.remove("frameInsets");
+      log("info", "Bordes de la ventana: se volverán a medir con el próximo visor.");
+      return { ok: true, insets: effectiveInsets() };
     case "pacs-dm:viewer-input":
       if (tabId != null && state.managed[tabId]) upsertManaged(tabId, { inputAt: Date.now() });
       return;
@@ -1383,9 +1505,11 @@ async function getStatus() {
       ids: pick.displays.map((d) => d.id),
       reason: pick.reason,
       warnings: pick.warnings,
-      bounds: G.targetBounds(pick.displays, settings.invisibleBorder),
+      bounds: G.targetBounds(pick.displays, effectiveInsets()),
     },
     managed,
+    insets: effectiveInsets(),
+    learnedInsets,
     launches: Object.values(state.launches),
     alerts: state.alerts,
     log: entries,

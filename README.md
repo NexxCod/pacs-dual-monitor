@@ -24,6 +24,7 @@ Ahora:
 - **Guardia**: si otro programa mueve la ventana mientras el visor carga, se restaura al instante. Pasados unos segundos, si tú la mueves, se respeta.
 - **Zoom de Synapse fijo en 100%**. En el visor, Ctrl+rueda, Ctrl+ y Ctrl− ya no hacen zoom al navegador (Synapse sigue recibiendo esas teclas).
 - **El visor informa su escala**: si cambió *después* de abrir el estudio, se recarga solo (si aún no lo usaste) o te avisa con un botón **Recargar visor**, para no medir sobre un visor mal calibrado.
+- **El visor nunca se pasa del borde de la pantalla**: con el primer movimiento del mouse sobre el visor, la extensión mide dónde quedó de verdad el área del visor; si se pasa (por ejemplo hacia abajo) o deja un hueco, corrige la ventana y recuerda esa medida para los próximos estudios. Si ya estabas usando el visor no lo mueve: te ofrece **Ajustar ahora**.
 - **Detecta imagen deformada** (contenido estirado) y le pide a Synapse recalcular; si persiste, te avisa.
 - **Avisa si la escala de Windows no es 100%** en los monitores del visor (aviso rojo y "!" en el ícono).
 - **Mejor elección de monitores**: los dos externos iguales y contiguos, aunque el principal de Windows sea un externo o tengas el notebook cerrado. La ventana ya no queda debajo de la barra de tareas. Si en Windows el notebook quedó *entre* los dos externos, usa uno solo y te avisa para que reordenes las pantallas (antes la ventana pasaba por encima del notebook).
@@ -88,7 +89,7 @@ La página de **Opciones** muestra la escala de cada monitor y te avisa si algo 
 | Cerrar visores anteriores o huérfanos | Sí | Evita que un visor viejo mantenga el "candado" de Synapse. |
 | Mostrar avisos en pantalla | Sí | Los errores se muestran siempre. |
 | Si hay un solo monitor externo, usarlo solo | No | Útil si a veces trabajas con un solo externo. |
-| Borde invisible de Windows | 7 px | Ajusta si ves una franja o la ventana se pasa del borde. |
+| Borde invisible de Windows (lados, valor inicial) | 7 px | Punto de partida para los lados (abajo parte en 0). Después se usan los bordes medidos en tu equipo; en *Monitores* puedes **Volver a medir los bordes**. |
 | Guardia tras cargar el visor | 12 s | Tiempo en que se corrige cualquier movimiento de la ventana. |
 | Monitores del visor | Automático | En la tabla de monitores puedes marcar a mano cuáles usar. |
 
@@ -106,7 +107,8 @@ La página de **Opciones** muestra la escala de cada monitor y te avisa si algo 
 
 - Geometría (sin dependencias): `node --test tests/geometry.test.js`
 - Extremo a extremo en Chromium real contra un Synapse simulado (Linux, requiere Xvfb, openssl y Playwright):
-  `npm install` y luego `npm run test:e2e`
+  `npm install` y luego `npm run test:e2e`. La prueba de bordes mueve el mouse real con python-xlib
+  (`pip install python-xlib`; si no está, se omite). Para usar otro Python: `PACS_PYTHON=/ruta/python`.
 
 ---
 
