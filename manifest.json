@@ -2,13 +2,15 @@
   "manifest_version": 3,
   "name": "PACS Dual Monitor",
   "short_name": "PACS Dual Monitor",
-  "description": "Expande el visor PACS a dos monitores (auto + atajo manual) y limpia ventanas/lanzadoras pegadas de Synapse.",
-  "version": "1.3.1",
+  "description": "Abre el visor de Synapse ya ubicado en los dos monitores externos, con zoom y escala correctos para medir, y verifica que el estudio realmente abra (sin pantalla negra).",
+  "version": "2.0.0",
+  "minimum_chrome_version": "111",
   "author": "Marcelo Salinas Villagra",
   "permissions": [
     "system.display",
     "tabs",
-    "webNavigation"
+    "webNavigation",
+    "storage"
   ],
   "host_permissions": [
     "https://sjdpacs.synapsetimed.cl/*"
@@ -22,19 +24,34 @@
         "https://sjdpacs.synapsetimed.cl/*"
       ],
       "js": [
+        "page-guard.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "https://sjdpacs.synapsetimed.cl/*"
+      ],
+      "js": [
         "content.js"
       ],
-      "run_at": "document_idle",
+      "run_at": "document_start",
       "all_frames": true
     }
   ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
   "icons": {
+    "16": "icon16.png",
     "48": "icon48.png",
-    "128": "icon128.png",
-    "16": "icon16.png"
+    "128": "icon128.png"
   },
   "action": {
-    "default_title": "Reposicionar visor PACS en los dos monitores (Ctrl+Shift+Y)"
+    "default_title": "PACS Dual Monitor — click o Ctrl+Shift+Y: reubicar el visor"
   },
   "commands": {
     "reposition-viewer": {
@@ -42,7 +59,7 @@
         "default": "Ctrl+Shift+Y",
         "mac": "Command+Shift+Y"
       },
-      "description": "Reposicionar el visor PACS en los dos monitores"
+      "description": "Reubicar el visor PACS en los dos monitores"
     }
   }
 }

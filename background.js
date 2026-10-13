@@ -1,256 +1,1300 @@
-const URL_PATTERN = "/ImageViewer/layout";
-const repositionedWindows = new Set();
+// background.js — PACS Dual Monitor (service worker MV3)
+//
+// Dos objetivos:
+//
+// 1) DIMENSIONES CORRECTAS (mediciones confiables). Synapse exige zoom del
+//    navegador y escala de Windows al 100%, y calibra el visor cuando abre el
+//    estudio. Si la ventana cambia de monitor/escala/tamano despues de eso, las
+//    mediciones y el True Size pueden quedar mal. Por eso:
+//    - la ventana se ubica en los dos monitores externos ANTES de que cargue
+//      el visor (desde la lanzadera o al empezar la navegacion), no despues;
+//    - se bloquea el "restaurar posicion" de Synapse (page-guard.js), que
+//      Chrome recorta a un solo monitor y achicaba la ventana a mitad de carga;
+//    - una guardia corta (onBoundsChanged) corrige cualquier otro cambio;
+//    - zoom de Synapse fijo en 100%;
+//    - el visor informa su escala/tamano; si cambiaron despues de inicializar,
+//      se recarga solo (si aun no lo usaste) o te avisa con un boton.
+//
+// 2) QUE EL ESTUDIO ABRA (sin pantalla negra). Cada click en un estudio se
+//    sigue hasta confirmar que un visor lo cargo. Si Synapse muestra "abierta
+//    en otra ventana": se trae al frente el visor existente y se verifica que
+//    el estudio llegue; si no llega (visor zombie) se cierra y se reintenta;
+//    si no hay visor (candado pegado) se reintenta con espera creciente; si
+//    todo falla, se avisa en pantalla. Tambien se recupera el visor que queda
+//    en negro por perdida del contexto grafico o error de red.
 
-const WINDOWS_INVISIBLE_BORDER = 7;
+importScripts("lib/geometry.js");
+const G = self.PacsGeometry;
 
-// === Config ===
-const CLOSE_ORPHAN_VIEWERS = true;
-const WORKLIST_HINTS = ["/WebQuery", "/Synapse/Web"];
+const HOST = "sjdpacs.synapsetimed.cl";
+const NAV_FILTER = { url: [{ hostEquals: HOST }] };
+const VIEWER_RE = /\/ImageViewer\/layout/i;
+const LAUNCHER_RE = /\/WebQuery\/Index/i;
+const WINPASS_RE = /winpass=true/i;
 
-const MIN_DISPLAYS = 3;
-const DISPLAY_RETRY_TRIES = 5;
-const DISPLAY_RETRY_DELAY = 400;
-const VERIFY_TRIES = 3;
-const VERIFY_TOLERANCE_PX = 80;
-const VERIFY_MIN_WIDTH_RATIO = 0.6;
+const DEFAULT_SETTINGS = Object.freeze({
+  placeViewer: true, // ubicar el visor en los monitores externos
+  placeLauncher: true, // ...desde que aparece la lanzadera (recomendado)
+  blockPageResize: true, // bloquear moveTo/resizeTo de Synapse
+  forceZoom100: true, // zoom de Synapse siempre 100%
+  closeOrphanViewers: true, // cerrar visores viejos/zombie
+  launcherRecovery: true, // verificar que el estudio abra y recuperar
+  autoReload: true, // recargar solo el visor si quedo mal (y no lo usaste)
+  showNotices: true, // avisos en pantalla
+  singleMonitorFallback: false, // si hay un solo externo, usarlo solo
+  invisibleBorder: 7, // borde invisible de Windows (px)
+  guardSeconds: 12, // segundos de guardia tras cargar el visor
+  displayIds: [], // monitores elegidos a mano ([] = automatico)
+});
 
-// Synapse redimensiona la ventana DESPUES de que la posicionamos (al terminar
-// de cargar el visor). Estos "settle checks" re-aplican los bounds varias veces
-// en los primeros segundos para ganarle a ese resize tardio.
-// Despues de la ultima revision dejamos de intervenir (para no pelear si el
-// usuario decide redimensionar a mano).
-const SETTLE_CHECKPOINTS_MS = [1000, 2200, 3800, 6000];
+// Tiempos y umbrales.
+const T = {
+  exactPx: 3, // diferencia aceptada como "exacto"
+  guardDriftPx: 12, // la guardia solo actua sobre cambios mayores
+  guardBeforeLoadMs: 45000, // guardia mientras el visor carga
+  guardMaxReapplies: 6,
+  applyRetries: 2,
+  settlePollMs: 40,
+  settleMaxMs: 450,
+  deliveryWaitMs: 8000, // espera a que el visor existente reciba el estudio
+  launcherStuckMs: 20000, // lanzadera sin aviso que no avanza
+  launchMaxAttempts: 3,
+  retryDelayMs: [0, 1200, 3000, 5000],
+  activityTimeoutMs: 1500,
+  reloadCooldownMs: 120000,
+  maxAutoReloads: 2,
+};
 
 // =====================================================================
-// 1) Auto: posicionar cuando se CREA el visor (primera vez)
+// Estado (sobrevive a que Chrome duerma el service worker)
 // =====================================================================
-chrome.webNavigation.onCompleted.addListener(async (details) => {
-  if (details.frameId !== 0) return;
-  const tab = await chrome.tabs.get(details.tabId);
-  if (!tab.url || !tab.url.includes(URL_PATTERN)) return;
+const state = { managed: {}, launches: {}, warned: {}, alerts: {} };
+let settings = Object.assign({}, DEFAULT_SETTINGS);
 
-  if (repositionedWindows.has(tab.windowId)) {
-    if (CLOSE_ORPHAN_VIEWERS) cleanupOrphanViewers(tab.windowId).catch(() => {});
-    return;
-  }
-  console.log(`[PACS] Detected ImageViewer tab: ${details.tabId}, window: ${tab.windowId}`);
+const ready = (async () => {
   try {
-    await moveToDualMonitor(details.tabId, tab.windowId);
-    if (CLOSE_ORPHAN_VIEWERS) await cleanupOrphanViewers(tab.windowId);
-  } catch (err) {
-    console.error("[PACS] Error:", err);
-  }
-});
-
-chrome.windows.onRemoved.addListener((windowId) => {
-  repositionedWindows.delete(windowId);
-});
-
-// =====================================================================
-// 2) Manual: forzar reposicionamiento on-demand (atajo Ctrl+Shift+Y o icono)
-// =====================================================================
-chrome.commands.onCommand.addListener((command) => {
-  if (command === "reposition-viewer") repositionViewerNow();
-});
-chrome.action.onClicked.addListener(() => repositionViewerNow());
-
-async function findViewerWindow() {
-  const wins = await chrome.windows.getAll({ populate: true });
-  const candidates = wins.filter((w) =>
-    (w.tabs || []).some((t) => t.url && t.url.includes(URL_PATTERN))
-  );
-  if (candidates.length === 0) return null;
-  const focused = candidates.find((w) => w.focused);
-  if (focused) return focused;
-  candidates.sort((a, b) => b.id - a.id);
-  return candidates[0];
-}
-
-async function repositionViewerNow() {
-  const w = await findViewerWindow();
-  if (!w) {
-    console.warn("[PACS] No encontre ventana del visor (/ImageViewer/layout) para reposicionar.");
-    return;
-  }
-  const viewerTab = (w.tabs || []).find((t) => t.url && t.url.includes(URL_PATTERN));
-  console.log(`[PACS] Reposicion MANUAL de window ${w.id}.`);
-  repositionedWindows.delete(w.id);
-  try {
-    await moveToDualMonitor(viewerTab.id, w.id);
+    const [loc, ses] = await Promise.all([
+      chrome.storage.local.get(["settings"]),
+      chrome.storage.session.get(["managed", "launches", "warned", "alerts"]),
+    ]);
+    settings = Object.assign({}, DEFAULT_SETTINGS, loc.settings || {});
+    state.managed = ses.managed || {};
+    state.launches = ses.launches || {};
+    state.warned = ses.warned || {};
+    state.alerts = ses.alerts || {};
   } catch (e) {
-    console.error("[PACS] Error en reposicion manual:", e);
+    console.warn("[PACS] No pude leer el estado guardado:", e);
   }
+})();
+
+let saveTimer = null;
+function saveState() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    chrome.storage.session
+      .set({ managed: state.managed, launches: state.launches, warned: state.warned, alerts: state.alerts })
+      .catch(() => {});
+  }, 50);
 }
 
-// =====================================================================
-// 3) Mensajes del content script (lanzadera pegada)
-// =====================================================================
-chrome.runtime.onMessage.addListener((msg, sender) => {
-  if (!msg || !sender.tab) return;
-  if (msg.type === "launcher-stuck") {
-    const wid = sender.tab.windowId;
-    chrome.windows.get(wid, { populate: true }, (w) => {
-      const tabs = (w && w.tabs) || [];
-      const onlyLauncher =
-        tabs.length === 1 &&
-        tabs[0].url &&
-        tabs[0].url.includes("winpass=true") &&
-        tabs[0].url.includes("/WebQuery/Index");
-      if (onlyLauncher) {
-        console.log(`[PACS] Cerrando lanzadera pegada (window ${wid}).`);
-        chrome.windows.remove(wid).catch((e) => console.warn("[PACS]", e));
-      } else {
-        console.log(`[PACS] Lanzadera pegada pero la ventana ${wid} tiene mas tabs; no se cierra por seguridad.`);
-      }
-    });
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.settings) {
+    settings = Object.assign({}, DEFAULT_SETTINGS, changes.settings.newValue || {});
+    displayCache = null;
+    log("info", "Opciones actualizadas.");
   }
 });
 
 // =====================================================================
-// Helpers
+// Registro (consola + pagina de Opciones)
+// =====================================================================
+const LOG_MAX = 400;
+let logQueue = [];
+let logTimer = null;
+
+function log(level, msg, data) {
+  const fn = console[level] || console.log;
+  if (data !== undefined) fn("[PACS]", msg, data);
+  else fn("[PACS]", msg);
+  const entry = { t: Date.now(), level, msg };
+  if (data !== undefined) entry.data = data;
+  logQueue.push(entry);
+  if (!logTimer) logTimer = setTimeout(flushLog, 300);
+}
+
+// Las escrituras del registro van en fila: dos escrituras simultaneas leerian
+// el mismo registro previo y una borraria lo agregado por la otra.
+let logChain = Promise.resolve();
+function withLogLock(fn) {
+  logChain = logChain.then(fn).catch(() => {});
+  return logChain;
+}
+
+function flushLog() {
+  clearTimeout(logTimer);
+  logTimer = null;
+  return withLogLock(async () => {
+    if (!logQueue.length) return;
+    const batch = logQueue;
+    logQueue = [];
+    const { log: prev = [] } = await chrome.storage.session.get("log");
+    await chrome.storage.session.set({ log: prev.concat(batch).slice(-LOG_MAX) });
+  });
+}
+
+function clearLog() {
+  logQueue = [];
+  return withLogLock(() => chrome.storage.session.set({ log: [] }));
+}
+
+function track(promise) {
+  if (promise && promise.catch) promise.catch((e) => log("error", "Error inesperado", String((e && e.stack) || e)));
+}
+
+// =====================================================================
+// Utilidades
 // =====================================================================
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function getDisplaysWithRetry() {
-  let displays = await chrome.system.display.getInfo();
-  let attempt = 1;
-  while (displays.length < MIN_DISPLAYS && attempt < DISPLAY_RETRY_TRIES) {
-    console.log(`[PACS] Solo ${displays.length} monitores, reintentando (${attempt}/${DISPLAY_RETRY_TRIES})...`);
-    await delay(DISPLAY_RETRY_DELAY);
-    displays = await chrome.system.display.getInfo();
-    attempt++;
-  }
-  return displays;
+function withTimeout(promise, ms) {
+  return Promise.race([promise, delay(ms).then(() => null)]);
 }
 
-async function cleanupOrphanViewers(keepWindowId) {
-  const wins = await chrome.windows.getAll({ populate: true });
-  for (const w of wins) {
-    if (w.id === keepWindowId) continue;
-    const tabs = w.tabs || [];
-    const hasViewer = tabs.some((t) => t.url && t.url.includes(URL_PATTERN));
-    if (!hasViewer) continue;
-    const isWorklist = tabs.some(
-      (t) => t.url && WORKLIST_HINTS.some((h) => t.url.includes(h))
-    );
-    if (isWorklist) {
-      console.log(`[PACS] Window ${w.id} tiene worklist, no se cierra.`);
+function urlParts(u) {
+  try {
+    const p = new URL(u);
+    return { host: p.hostname, pathname: p.pathname, rest: p.pathname + p.search + p.hash };
+  } catch (e) {
+    return null;
+  }
+}
+function isSynapseUrl(u) {
+  const p = urlParts(u);
+  return !!p && p.host === HOST;
+}
+function isViewerUrl(u) {
+  const p = urlParts(u);
+  return !!p && p.host === HOST && VIEWER_RE.test(p.rest);
+}
+function isLauncherUrl(u) {
+  const p = urlParts(u);
+  return !!p && p.host === HOST && LAUNCHER_RE.test(p.rest) && WINPASS_RE.test(p.rest);
+}
+// Para el registro: sin parametros y con los numeros/identificadores largos
+// enmascarados (pueden ser datos del paciente o del estudio).
+function shortUrl(u) {
+  const p = urlParts(u);
+  return p ? maskIds(p.pathname) : "";
+}
+function maskIds(text) {
+  return String(text || "").replace(/[0-9a-f]{16,}|\d[\d.]{4,}/gi, "#");
+}
+// Identifica un estudio/URL sin guardarla (hash FNV-1a).
+function urlKey(u) {
+  let h = 0x811c9dc5;
+  const s = String(u || "");
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16);
+}
+function box(w) {
+  return w ? { left: w.left, top: w.top, width: w.width, height: w.height, state: w.state } : null;
+}
+function pct(x) {
+  return Math.round(x * 100) + "%";
+}
+
+async function getTab(tabId) {
+  try {
+    return await chrome.tabs.get(tabId);
+  } catch (e) {
+    return null;
+  }
+}
+
+async function findViewerTabs() {
+  const tabs = await chrome.tabs.query({ url: `https://${HOST}/*` });
+  return tabs.filter((t) => isViewerUrl(t.url));
+}
+
+function upsertManaged(tabId, patch) {
+  const rec = Object.assign({ tabId }, state.managed[tabId] || {}, patch);
+  state.managed[tabId] = rec;
+  saveState();
+  return rec;
+}
+
+function managedByWindow(windowId) {
+  return Object.values(state.managed).find((r) => r.windowId === windowId) || null;
+}
+
+// =====================================================================
+// Avisos en pantalla, alertas del icono
+// =====================================================================
+// Si la pagina aun no tiene el content script (esta cargando, o es una pagina
+// de error), el aviso queda en cola y se entrega cuando la pagina se reporta.
+const pendingNotices = new Map();
+
+async function noticeTab(tabId, level, text, opts) {
+  opts = opts || {};
+  if (!settings.showNotices && level !== "error") return;
+  const payload = {
+    type: "pacs-dm:notice",
+    level,
+    text,
+    sticky: !!opts.sticky,
+    actions: opts.actions || [],
+    key: opts.key,
+  };
+  try {
+    await chrome.tabs.sendMessage(tabId, payload, { frameId: 0 });
+  } catch (e) {
+    const queue = (pendingNotices.get(tabId) || []).filter((p) => !p.key || p.key !== payload.key);
+    queue.push(payload);
+    pendingNotices.set(tabId, queue.slice(-5));
+  }
+}
+
+function flushPendingNotices(tabId) {
+  const queue = pendingNotices.get(tabId);
+  if (!queue) return;
+  pendingNotices.delete(tabId);
+  for (const p of queue) chrome.tabs.sendMessage(tabId, p, { frameId: 0 }).catch(() => {});
+}
+
+async function noticeOtherSynapseTabs(level, text, opts) {
+  const tabs = await chrome.tabs.query({ url: `https://${HOST}/*` });
+  for (const t of tabs) {
+    if (!isViewerUrl(t.url) && !isLauncherUrl(t.url)) noticeTab(t.id, level, text, opts);
+  }
+}
+
+function warnOnce(key, tabId, level, text, opts) {
+  if (state.warned[key]) return;
+  state.warned[key] = Date.now();
+  saveState();
+  log(level === "error" ? "error" : "warn", text);
+  if (tabId != null) noticeTab(tabId, level, text, Object.assign({ sticky: true, key }, opts || {}));
+}
+
+function setAlert(key, level, text) {
+  state.alerts[key] = { level, text, t: Date.now() };
+  saveState();
+  refreshBadge();
+}
+function clearAlert(key) {
+  if (!state.alerts[key]) return;
+  delete state.alerts[key];
+  saveState();
+  refreshBadge();
+}
+function refreshBadge() {
+  const list = Object.values(state.alerts);
+  const error = list.some((a) => a.level === "error");
+  chrome.action.setBadgeText({ text: list.length ? "!" : "" }).catch(() => {});
+  if (list.length) chrome.action.setBadgeBackgroundColor({ color: error ? "#d93025" : "#e8a200" }).catch(() => {});
+  const base = "PACS Dual Monitor — click o Ctrl+Shift+Y: reubicar el visor";
+  chrome.action
+    .setTitle({ title: list.length ? base + "\n\n" + list.map((a) => "• " + a.text).join("\n") : base })
+    .catch(() => {});
+}
+
+// =====================================================================
+// Monitores y rectangulo destino
+// =====================================================================
+let displayCache = null;
+let lastGoodDisplayCount = 0;
+
+async function getDisplays(fresh) {
+  if (!fresh && displayCache && Date.now() - displayCache.at < 4000) return displayCache.list;
+  const list = await chrome.system.display.getInfo();
+  displayCache = { at: Date.now(), list };
+  return list;
+}
+
+async function computeTarget() {
+  let displays = await getDisplays();
+  // Al despertar o al conectar el dock, Windows a veces informa menos
+  // monitores por un instante: reintentar brevemente.
+  for (let i = 0; i < 3 && displays.length < lastGoodDisplayCount; i++) {
+    await delay(250);
+    displays = await getDisplays(true);
+  }
+  const pick = G.pickViewerDisplays(displays, {
+    displayIds: settings.displayIds,
+    singleMonitorFallback: settings.singleMonitorFallback,
+  });
+  if (!pick) {
+    log("info", `Sin monitores externos para el visor (${displays.length} monitor/es): no se reubica.`);
+    return null;
+  }
+  lastGoodDisplayCount = Math.max(lastGoodDisplayCount, displays.length);
+  return {
+    bounds: G.targetBounds(pick.displays, settings.invisibleBorder),
+    displayIds: pick.displays.map((d) => d.id),
+    names: pick.displays.map((d) => d.name || d.id),
+    scales: pick.displays.map(G.displayScale),
+    reason: pick.reason,
+    warnings: pick.warnings,
+  };
+}
+
+let displayTimer = null;
+chrome.system.display.onDisplayChanged.addListener(() => {
+  displayCache = null;
+  clearTimeout(displayTimer);
+  displayTimer = setTimeout(() => track(onDisplaysSettled()), 1500);
+});
+
+async function onDisplaysSettled() {
+  await ready;
+  const displays = await getDisplays(true);
+  log("info", `Cambió la configuración de monitores (${displays.length}).`);
+  if (!settings.placeViewer) return;
+  const target = await computeTarget();
+  if (!target) return;
+  for (const rec of Object.values(state.managed)) {
+    const tab = await getTab(rec.tabId);
+    if (!tab) continue;
+    // Al apagarse/encenderse un monitor Windows mueve las ventanas al
+    // principal: se compara con donde ESTA la ventana, no con el destino viejo.
+    const win = await chrome.windows.get(tab.windowId).catch(() => null);
+    if (!win || G.boundsDelta(win, target.bounds) <= T.exactPx) {
+      upsertManaged(rec.tabId, { target: Object.assign({}, rec.target, { bounds: target.bounds }) });
       continue;
     }
-    console.log(`[PACS] Cerrando viewer huerfano: window ${w.id}`);
+    upsertManaged(rec.tabId, {
+      windowId: tab.windowId,
+      target: { bounds: target.bounds, displayIds: target.displayIds, names: target.names, scales: target.scales },
+      guardUntil: Date.now() + 5000,
+      reapplies: 0,
+    });
+    log("info", "Reubicando el visor por cambio de monitores.", { ahora: box(win), destino: target.bounds });
+    await applyBounds(tab.windowId, target.bounds, "cambio de monitores");
+  }
+}
+
+// =====================================================================
+// Mover/redimensionar ventanas
+// =====================================================================
+const winLocks = new Map();
+const ownUntil = new Map();
+
+function withWindowLock(windowId, fn) {
+  const prev = winLocks.get(windowId) || Promise.resolve();
+  const run = prev.catch(() => {}).then(fn);
+  const tail = run.catch(() => {});
+  winLocks.set(windowId, tail);
+  tail.then(() => {
+    if (winLocks.get(windowId) === tail) winLocks.delete(windowId);
+  });
+  return run;
+}
+
+function markOwn(windowId, ms) {
+  ownUntil.set(windowId, Math.max(ownUntil.get(windowId) || 0, Date.now() + ms));
+}
+function isOwn(windowId) {
+  return (ownUntil.get(windowId) || 0) > Date.now();
+}
+
+// Lee la ventana hasta que deja de cambiar (Windows aplica algunos cambios,
+// como el de escala al pasar de monitor, de forma asincrona).
+async function settle(windowId) {
+  let prev = await chrome.windows.get(windowId);
+  const until = Date.now() + T.settleMaxMs;
+  while (Date.now() < until) {
+    await delay(T.settlePollMs);
+    const cur = await chrome.windows.get(windowId);
+    if (G.boundsDelta(cur, prev) === 0 && cur.state === prev.state) return cur;
+    prev = cur;
+  }
+  return prev;
+}
+
+// Lleva la ventana al rectangulo b. Camino rapido (2-3 llamadas, sin esperas)
+// para ganarle a la carga del visor; si no queda exacta, reintenta con la
+// secuencia lenta (mover, esperar, redimensionar) que necesita Windows cuando
+// los monitores tienen distinta escala.
+async function applyBounds(windowId, b, why) {
+  return withWindowLock(windowId, async () => {
+    let w = await chrome.windows.get(windowId);
+    if (w.state === "normal" && G.boundsDelta(w, b) <= T.exactPx) return { ok: true, changed: false, win: w };
+    // Solo desde aqui los cambios de la ventana son nuestros (la guardia los ignora).
+    markOwn(windowId, 3000);
     try {
-      await chrome.windows.remove(w.id);
-      repositionedWindows.delete(w.id);
-    } catch (e) {
-      console.warn(`[PACS] No pude cerrar window ${w.id}:`, e);
+      const before = box(w);
+      if (w.state !== "normal") await chrome.windows.update(windowId, { state: "normal" });
+      // Primero saltar al monitor destino (cambio de escala) y luego dimensionar.
+      if (!G.centerInside(w, b)) await chrome.windows.update(windowId, { left: b.left, top: b.top });
+      await chrome.windows.update(windowId, { left: b.left, top: b.top, width: b.width, height: b.height });
+      w = await chrome.windows.get(windowId);
+      for (let i = 1; i <= T.applyRetries && G.boundsDelta(w, b) > T.exactPx; i++) {
+        w = await settle(windowId);
+        if (G.boundsDelta(w, b) <= T.exactPx) break;
+        await chrome.windows.update(windowId, { left: b.left, top: b.top });
+        await delay(80 * i);
+        await chrome.windows.update(windowId, { width: b.width, height: b.height });
+        await delay(80 * i);
+        await chrome.windows.update(windowId, { left: b.left, top: b.top, width: b.width, height: b.height });
+        w = await settle(windowId);
+      }
+      const delta = G.boundsDelta(w, b);
+      const ok = delta <= T.exactPx;
+      log(
+        ok ? "info" : "warn",
+        ok ? `Ventana ${windowId} ubicada (${why}).` : `La ventana ${windowId} quedó a ${delta}px del destino (${why}).`,
+        { antes: before, destino: b, final: box(w) }
+      );
+      return { ok, changed: true, win: w, delta };
+    } finally {
+      ownUntil.set(windowId, Date.now() + 500);
+    }
+  });
+}
+
+// =====================================================================
+// Preparar la ventana del visor (o de la lanzadera que sera el visor)
+// =====================================================================
+const preparing = new Map();
+
+function prepareWindow(tabId, url, role, why) {
+  const prev = preparing.get(tabId) || Promise.resolve();
+  const run = prev.catch(() => {}).then(() => doPrepare(tabId, url, role, why));
+  preparing.set(tabId, run);
+  run.catch(() => {}).then(() => {
+    if (preparing.get(tabId) === run) preparing.delete(tabId);
+  });
+  return run;
+}
+
+async function doPrepare(tabId, url, role, why) {
+  await ready;
+  const tab = await getTab(tabId);
+  if (!tab) return null;
+  const now = Date.now();
+  const key = urlKey(url);
+  const old = state.managed[tabId];
+  const patch = {
+    role,
+    windowId: tab.windowId,
+    path: shortUrl(url),
+    navKey: key,
+    navAt: now,
+    guardUntil: now + T.guardBeforeLoadMs,
+    reapplies: 0,
+    loadedAt: null,
+    report: null,
+    relayouts: 0,
+  };
+  // Las recargas automaticas se cuentan por estudio.
+  if (!old || old.navKey !== key) Object.assign(patch, { autoReloads: 0, lastAutoReloadAt: 0 });
+  let rec = upsertManaged(tabId, patch);
+
+  if (isSynapseUrl(tab.url)) track(ensureZoom100(tabId, "antes de abrir el visor"));
+  if (!settings.placeViewer) return rec;
+
+  const target = await computeTarget();
+  if (!target) return rec;
+  let windowId = tab.windowId;
+  const win = await chrome.windows.get(windowId, { populate: true }).catch(() => null);
+  if (!win) return rec;
+  if (win.type === "normal") {
+    // Pestana dentro de una ventana normal: pasarla a un popup (sin barra de
+    // Chrome) creado directamente en su lugar.
+    const created = await chrome.windows.create({
+      tabId,
+      type: "popup",
+      focused: true,
+      left: target.bounds.left,
+      top: target.bounds.top,
+      width: target.bounds.width,
+      height: target.bounds.height,
+    });
+    windowId = created.id;
+    log("info", `Pestaña ${tabId} sacada de la ventana normal ${win.id} a un popup (${windowId}).`);
+  } else if (win.type !== "popup") {
+    log("info", `Ventana ${windowId} de tipo "${win.type}": no se toca.`);
+    return rec;
+  }
+  rec = upsertManaged(tabId, {
+    windowId,
+    target: { bounds: target.bounds, displayIds: target.displayIds, names: target.names, scales: target.scales },
+  });
+  await applyBounds(windowId, target.bounds, why);
+  target.warnings.forEach((text, i) => warnOnce(`display:${text}`, tabId, "warn", text, { key: `display-${i}` }));
+  return rec;
+}
+
+// =====================================================================
+// Zoom 100% (Synapse lo exige para que las mediciones sean correctas)
+// =====================================================================
+const zoomBusy = new Set();
+
+async function ensureZoom100(tabId, why) {
+  if (!settings.forceZoom100 || zoomBusy.has(tabId)) return;
+  zoomBusy.add(tabId);
+  try {
+    const z = await chrome.tabs.getZoom(tabId);
+    if (Math.abs(z - 1) < 0.005) return;
+    await chrome.tabs.setZoom(tabId, 1); // por origen: todo Synapse queda en 100%
+    log("info", `Zoom de Synapse ${pct(z)} → 100% (${why}).`);
+    noticeTab(tabId, "info", "Zoom del navegador ajustado a 100% (Synapse lo exige para que las mediciones sean correctas).", {
+      key: "zoom",
+    });
+  } catch (e) {
+    log("warn", "No pude ajustar el zoom.", String(e));
+  } finally {
+    zoomBusy.delete(tabId);
+  }
+}
+
+chrome.tabs.onZoomChange.addListener((info) => {
+  if (Math.abs(info.newZoomFactor - 1) < 0.005) return;
+  track(
+    (async () => {
+      await ready;
+      if (!settings.forceZoom100) return;
+      const tab = await getTab(info.tabId);
+      if (tab && isSynapseUrl(tab.url)) await ensureZoom100(info.tabId, "cambio de zoom");
+    })()
+  );
+});
+
+// =====================================================================
+// Navegacion
+// =====================================================================
+function isPrerender(d) {
+  return d.documentLifecycle === "prerender" || d.tabId < 0;
+}
+
+chrome.webNavigation.onBeforeNavigate.addListener((d) => {
+  if (d.frameId !== 0 || isPrerender(d)) return;
+  if (isViewerUrl(d.url)) track(prepareWindow(d.tabId, d.url, "viewer", "antes de cargar el visor"));
+  else if (isLauncherUrl(d.url)) track(onLauncherStart(d.tabId, d.url, d.timeStamp));
+}, NAV_FILTER);
+
+chrome.webNavigation.onCommitted.addListener((d) => {
+  if (d.frameId !== 0 || isPrerender(d)) return;
+  track(onCommitted(d));
+}, NAV_FILTER);
+
+chrome.webNavigation.onCompleted.addListener((d) => {
+  if (d.frameId !== 0 || isPrerender(d) || !isViewerUrl(d.url)) return;
+  track(onViewerCompleted(d));
+}, NAV_FILTER);
+
+chrome.webNavigation.onHistoryStateUpdated.addListener((d) => {
+  if (d.frameId !== 0 || isPrerender(d)) return;
+  track(
+    (async () => {
+      await ready;
+      // Visor cargado como aplicacion de una sola pagina (sin recargar).
+      if (isViewerUrl(d.url) && !state.managed[d.tabId]) await prepareWindow(d.tabId, d.url, "viewer", "visor (SPA)");
+    })()
+  );
+}, NAV_FILTER);
+
+chrome.webNavigation.onErrorOccurred.addListener((d) => {
+  if (d.frameId !== 0 || isPrerender(d) || /ERR_ABORTED/i.test(d.error)) return;
+  track(
+    (async () => {
+      await ready;
+      if (isViewerUrl(d.url)) {
+        await recoverViewer(d.tabId, `Error de red al abrir el visor (${d.error})`, { hasInput: false, force: true, silent: true });
+      } else if (isLauncherUrl(d.url) && state.launches[d.tabId]) {
+        await retryLaunch(state.launches[d.tabId], `error de red en la lanzadera (${d.error})`);
+      }
+    })()
+  );
+}, NAV_FILTER);
+
+async function onCommitted(d) {
+  await ready;
+  // Cualquier pagina de Synapse: zoom al 100% antes de que se abra un visor.
+  track(ensureZoom100(d.tabId, "página de Synapse"));
+  if (isViewerUrl(d.url)) {
+    await (preparing.get(d.tabId) || Promise.resolve()).catch(() => {});
+    const rec = state.managed[d.tabId];
+    if (!rec || rec.navKey !== urlKey(d.url)) {
+      // Redireccion del servidor, o Chrome durmio el service worker.
+      await prepareWindow(d.tabId, d.url, "viewer", "al confirmar la navegación");
+    } else {
+      upsertManaged(d.tabId, { role: "viewer" });
+      if (rec.target && settings.placeViewer) await applyBounds(rec.windowId, rec.target.bounds, "al confirmar la navegación");
+    }
+    upsertManaged(d.tabId, { committedAt: Date.now() });
+    chrome.tabs.update(d.tabId, { autoDiscardable: false }).catch(() => {});
+    await onViewerCommitted(d.tabId);
+  } else if (isLauncherUrl(d.url)) {
+    if (!state.launches[d.tabId]) await onLauncherStart(d.tabId, d.url, d.timeStamp);
+  } else if (state.managed[d.tabId]) {
+    // La pestana dejo de ser visor: dejar de gestionarla.
+    delete state.managed[d.tabId];
+    saveState();
+  }
+}
+
+async function onViewerCompleted(d) {
+  await ready;
+  const rec = upsertManaged(d.tabId, {
+    loadedAt: Date.now(),
+    guardUntil: Date.now() + settings.guardSeconds * 1000,
+  });
+  if (rec.target && settings.placeViewer) await applyBounds(rec.windowId, rec.target.bounds, "al terminar de cargar");
+  await cleanupOrphans(d.tabId);
+}
+
+chrome.tabs.onAttached.addListener((tabId, info) => {
+  if (state.managed[tabId]) upsertManaged(tabId, { windowId: info.newWindowId });
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  pendingNotices.delete(tabId);
+  pageEventCount.delete(tabId);
+  track(
+    (async () => {
+      await ready;
+      if (state.managed[tabId] || state.launches[tabId]) {
+        delete state.managed[tabId];
+        delete state.launches[tabId];
+        saveState();
+      }
+    })()
+  );
+});
+
+chrome.windows.onRemoved.addListener((windowId) => {
+  ownUntil.delete(windowId);
+  winLocks.delete(windowId);
+});
+
+// =====================================================================
+// Guardia: si algo mas mueve la ventana mientras el visor carga, se restaura
+// =====================================================================
+const guardTimers = new Map();
+
+chrome.windows.onBoundsChanged.addListener((win) => track(onBoundsChanged(win)));
+
+async function onBoundsChanged(win) {
+  await ready;
+  const rec = managedByWindow(win.id);
+  if (!rec || !rec.target || !settings.placeViewer || isOwn(win.id)) return;
+  const delta = G.boundsDelta(win, rec.target.bounds);
+  if (delta <= T.guardDriftPx) return;
+  const now = Date.now();
+  if (now > (rec.guardUntil || 0)) {
+    if (!rec.userMovedAt || now - rec.userMovedAt > 10000) {
+      log("info", `Moviste o redimensionaste el visor (Δ${delta}px); se respeta. Ctrl+Shift+Y lo vuelve a ubicar.`, box(win));
+    }
+    upsertManaged(rec.tabId, { userMovedAt: now });
+    return;
+  }
+  if ((rec.reapplies || 0) >= T.guardMaxReapplies) {
+    warnOnce(
+      `fight:${rec.tabId}:${rec.navKey}`,
+      rec.tabId,
+      "warn",
+      "Otro programa sigue moviendo la ventana del visor (¿la extensión de Synapse de Fujifilm?). Desactívala o usa Ctrl+Shift+Y."
+    );
+    return;
+  }
+  upsertManaged(rec.tabId, { reapplies: (rec.reapplies || 0) + 1 });
+  log("info", `Guardia: algo movió la ventana del visor (Δ${delta}px); restaurando.`, box(win));
+  clearTimeout(guardTimers.get(win.id));
+  guardTimers.set(
+    win.id,
+    setTimeout(() => {
+      guardTimers.delete(win.id);
+      const r = managedByWindow(win.id);
+      if (r && r.target) track(applyBounds(win.id, r.target.bounds, "guardia"));
+    }, 120)
+  );
+}
+
+// =====================================================================
+// Visores huerfanos / zombie
+// =====================================================================
+async function closeTabSmart(tabId, why) {
+  const tab = await getTab(tabId);
+  if (!tab) return false;
+  if (!isViewerUrl(tab.url) && !isLauncherUrl(tab.url)) {
+    log("warn", `No cierro la pestaña ${tabId}: ya no es visor ni lanzadera.`);
+    return false;
+  }
+  try {
+    const win = await chrome.windows.get(tab.windowId, { populate: true });
+    if ((win.tabs || []).length === 1) await chrome.windows.remove(win.id);
+    else await chrome.tabs.remove(tabId);
+    log("info", `Cerrada: ${why} (pestaña ${tabId}).`);
+    return true;
+  } catch (e) {
+    log("warn", `No pude cerrar la pestaña ${tabId}.`, String(e));
+    return false;
+  }
+}
+
+async function cleanupOrphans(keepTabId) {
+  if (!settings.closeOrphanViewers) return;
+  const viewers = await findViewerTabs();
+  for (const t of viewers) {
+    if (t.id === keepTabId) continue;
+    await closeTabSmart(t.id, "visor anterior/huérfano");
+  }
+  // Lanzaderas de intentos anteriores que quedaron pegadas.
+  for (const L of Object.values(state.launches)) {
+    if (L.tabId !== keepTabId && (L.phase === "failed" || L.phase === "awaiting-delivery")) {
+      await closeTabSmart(L.tabId, "lanzadera pegada de un intento anterior");
+      delete state.launches[L.tabId];
+      saveState();
     }
   }
 }
 
-function boundsOK(win, bounds) {
-  const widthOK = win.width >= bounds.width * VERIFY_MIN_WIDTH_RATIO;
-  const posOK =
-    Math.abs(win.left - bounds.left) <= VERIFY_TOLERANCE_PX &&
-    Math.abs(win.top - bounds.top) <= VERIFY_TOLERANCE_PX;
-  return widthOK && posOK;
+// =====================================================================
+// Seguimiento de cada click en un estudio
+// =====================================================================
+// navTime: instante en que Chrome empezo la navegacion (details.timeStamp); no
+// se usa la hora en que el service worker procesa el evento, que puede llegar
+// tarde si estaba dormido.
+async function onLauncherStart(tabId, url, navTime) {
+  await ready;
+  const tab = await getTab(tabId);
+  if (!tab) return;
+  const t = Math.min(Number(navTime) || Date.now(), Date.now());
+  let L = state.launches[tabId];
+  if (!L || L.phase === "failed") {
+    L = state.launches[tabId] = { tabId, kind: "launcher", startedAt: t, attempt: 1 };
+    log("info", `Click en un estudio: lanzadera abierta (pestaña ${tabId}).`);
+  }
+  Object.assign(L, { phase: "pending", navAt: t, warningAt: null, retryAt: null });
+  saveState();
+  // Ubicar desde ya la ventana de la lanzadera (sera la ventana del visor), asi
+  // el visor nace con el tamano y la escala finales. Solo si es una pestana o
+  // ventana nueva: nunca se mueve la ventana de la worklist.
+  const fresh = !tab.url || tab.url === "about:blank" || isLauncherUrl(tab.url) || isViewerUrl(tab.url);
+  if (fresh && settings.placeLauncher) await prepareWindow(tabId, url, "launcher", "lanzadera");
 }
 
-async function applyBounds(windowId, bounds) {
-  await chrome.windows.update(windowId, { state: "normal" });
-  await delay(150);
-  await chrome.windows.update(windowId, { left: bounds.left, top: bounds.top });
-  await delay(150);
-  await chrome.windows.update(windowId, { width: bounds.width, height: bounds.height });
-  await delay(150);
-  await chrome.windows.update(windowId, {
-    left: bounds.left, top: bounds.top, width: bounds.width, height: bounds.height,
-  });
-  await delay(150);
-  return chrome.windows.get(windowId);
+async function onViewerCommitted(tabId) {
+  const L = state.launches[tabId];
+  // Exito solo si es la lanzadera que paso a ser visor. Si el aviso salio en el
+  // propio visor y lo recargamos, el intento sigue abierto hasta ver si vuelve.
+  if (L && L.kind === "launcher") finishLaunch(L, "la lanzadera abrió el visor");
+  // Lanzaderas que esperaban que el estudio llegara a este visor.
+  for (const other of Object.values(state.launches)) {
+    if (other.tabId === tabId || other.phase !== "awaiting-delivery") continue;
+    if ((other.deliveryTabs || []).includes(tabId)) {
+      await closeLaunchTab(other, "el estudio se abrió en el visor existente");
+      finishLaunch(other, "entregado al visor existente (navegación)");
+    }
+  }
+  await cleanupOrphans(tabId);
 }
 
-// Re-aplica los bounds en varios momentos para ganarle al resize tardio de Synapse.
-function scheduleSettleChecks(windowId, bounds) {
-  SETTLE_CHECKPOINTS_MS.forEach((ms) => {
-    setTimeout(async () => {
-      try {
-        const w = await chrome.windows.get(windowId);
-        if (!w) return;
-        if (boundsOK(w, bounds)) {
-          console.log(`[PACS] Settle ${ms}ms: OK (w=${w.width}), sin cambios.`);
-          return;
-        }
-        console.log(`[PACS] Settle ${ms}ms: Synapse la movio (w=${w.width}), re-aplicando bounds.`);
-        await applyBounds(windowId, bounds);
-      } catch (e) {
-        // ventana cerrada / inexistente: ignorar
-      }
-    }, ms);
-  });
+function finishLaunch(L, how) {
+  const secs = Math.round((Date.now() - (L.startedAt || Date.now())) / 100) / 10;
+  log("info", `Estudio abierto: ${how} (${secs}s, intento ${L.attempt || 1}).`);
+  delete state.launches[L.tabId];
+  saveState();
+  clearAlert("launch");
 }
 
-async function moveToDualMonitor(tabId, windowId) {
-  const displays = await getDisplaysWithRetry();
-  console.log("[PACS] Displays found:", displays.length);
-  displays.forEach((d, i) => {
-    console.log(`  [${i}] "${d.name}" primary=${d.isPrimary}`,
-      `bounds=${JSON.stringify(d.bounds)}`, `workArea=${JSON.stringify(d.workArea)}`);
-  });
+async function closeLaunchTab(L, why) {
+  if (L.kind === "launcher" || L.kind === "viewer") await closeTabSmart(L.tabId, `lanzadera (${why})`);
+}
 
-  if (displays.length < MIN_DISPLAYS) {
-    console.warn(`[PACS] Tras reintentos sigo viendo ${displays.length} monitores (esperaba ${MIN_DISPLAYS}). No reposiciono.`);
+function mostRecentViewer(tabs) {
+  return [...tabs].sort((a, b) => {
+    const na = (state.managed[a.id] && state.managed[a.id].navAt) || 0;
+    const nb = (state.managed[b.id] && state.managed[b.id].navAt) || 0;
+    return nb - na || b.id - a.id;
+  })[0];
+}
+
+async function focusViewerTab(tab, why) {
+  try {
+    const w = await chrome.windows.get(tab.windowId);
+    if (w.state === "minimized") await chrome.windows.update(w.id, { state: "normal" });
+    await chrome.windows.update(w.id, { focused: true });
+    if (!tab.active) await chrome.tabs.update(tab.id, { active: true });
+    const rec = state.managed[tab.id];
+    if (rec && rec.target && settings.placeViewer) await applyBounds(rec.windowId, rec.target.bounds, `traer al frente (${why})`);
+    log("info", `Visor existente traído al frente (pestaña ${tab.id}, ${why}).`);
+  } catch (e) {
+    log("warn", "No pude traer el visor al frente.", String(e));
+  }
+}
+
+async function getActivity(tabId) {
+  try {
+    return await withTimeout(chrome.tabs.sendMessage(tabId, { type: "pacs-dm:get-activity" }, { frameId: 0 }), T.activityTimeoutMs);
+  } catch (e) {
+    return null;
+  }
+}
+
+// ¿Llego un estudio nuevo a este visor despues del instante "since"? (el visor
+// navego o cambio de titulo/URL, o descargo un lote de datos de imagen).
+// Se usan marcas de tiempo y no "lineas base": Synapse puede entregar el
+// estudio antes de mostrar el aviso.
+function looksDelivered(act, since) {
+  if (!act) return false;
+  if ((act.docStartedAt || 0) > since) return true;
+  if ((act.titleChangedAt || 0) > since || (act.hrefChangedAt || 0) > since) return true;
+  const recent = (act.recent || []).filter((r) => r[0] > since);
+  const bytes = recent.reduce((sum, r) => sum + (r[1] || 0), 0);
+  return recent.length >= 8 && bytes >= 100000;
+}
+
+async function handleWarning(L) {
+  const tab = await getTab(L.tabId);
+  if (!tab) return;
+  L.kind = isLauncherUrl(tab.url) ? "launcher" : isViewerUrl(tab.url) ? "viewer" : "other";
+  L.warningAt = Date.now();
+  log("warn", `Synapse muestra "abierta en otra ventana" (${L.kind}, pestaña ${L.tabId}, intento ${L.attempt || 1}).`);
+  if (!settings.launcherRecovery) {
+    L.phase = "warning";
+    saveState();
     return;
   }
-
-  let externals = displays.filter((d) => !d.isPrimary);
-  if (externals.length < 2) {
-    const sorted = [...displays].sort(
-      (a, b) => b.bounds.width * b.bounds.height - a.bounds.width * a.bounds.height
-    );
-    externals = [sorted[0], sorted[1]];
+  const viewers = (await findViewerTabs()).filter((t) => t.id !== L.tabId);
+  if (viewers.length && L.kind === "other") {
+    // Aviso dentro de la worklist u otra pagina: solo traer el visor al frente.
+    await focusViewerTab(mostRecentViewer(viewers), "aviso en otra página de Synapse");
+    finishLaunch(L, "aviso en otra página; visor existente al frente");
+  } else if (viewers.length) {
+    // Synapse manda el estudio al visor que ya esta abierto: traerlo al
+    // frente y verificar que de verdad lo reciba.
+    await focusViewerTab(mostRecentViewer(viewers), "recibe el estudio");
+    Object.assign(L, {
+      phase: "awaiting-delivery",
+      deliveryTabs: viewers.map((v) => v.id),
+      deliverySince: L.navAt || L.startedAt,
+      deliveryDeadline: Date.now() + T.deliveryWaitMs,
+    });
+    saveState();
+    setTimeout(() => track(checkLaunch(L)), T.deliveryWaitMs + 50);
+  } else if (L.kind === "other") {
+    L.phase = "failed";
+    saveState();
+    const text =
+      "Synapse dice que el visor está abierto en otra ventana, pero no hay ningún visor en este Chrome. " +
+      "¿Quedó abierto en otro navegador o perfil? Ciérralo y vuelve a abrir el estudio.";
+    log("error", text);
+    noticeTab(L.tabId, "error", text, { sticky: true, key: "launch-failed" });
+    setAlert("launch", "error", "Synapse cree que hay otro visor abierto (no está en este Chrome).");
+  } else {
+    await retryLaunch(L, "no hay ningún visor abierto (el candado de Synapse quedó pegado)");
   }
-
-  const [d1, d2] = externals;
-  const wa1 = d1.workArea;
-  const wa2 = d2.workArea;
-  const left = Math.min(wa1.left, wa2.left);
-  const top = Math.min(wa1.top, wa2.top);
-  const right = Math.max(wa1.left + wa1.width, wa2.left + wa2.width);
-  const bottom = Math.max(wa1.top + wa1.height, wa2.top + wa2.height);
-
-  const B = WINDOWS_INVISIBLE_BORDER;
-  const bounds = {
-    left: left - B, top: top, width: right - left + 2 * B, height: bottom - top + B,
-  };
-  console.log("[PACS] Target bounds:", JSON.stringify(bounds));
-
-  const win = await chrome.windows.get(windowId);
-  let targetWindowId = windowId;
-  if (win.type !== "popup") {
-    console.log("[PACS] Creating new popup window...");
-    const newWindow = await chrome.windows.create({ tabId: tabId, type: "popup" });
-    targetWindowId = newWindow.id;
-    await delay(200);
-  }
-
-  let finalWin = await applyBounds(targetWindowId, bounds);
-  for (let i = 1; i <= VERIFY_TRIES; i++) {
-    if (boundsOK(finalWin, bounds)) { console.log(`[PACS] Ventana OK al intento ${i}.`); break; }
-    console.warn(`[PACS] Ventana no quedo bien (intento ${i}/${VERIFY_TRIES}). Reintentando.`,
-      JSON.stringify({ got: { l: finalWin.left, t: finalWin.top, w: finalWin.width, h: finalWin.height }, want: bounds }));
-    await delay(250);
-    finalWin = await applyBounds(targetWindowId, bounds);
-  }
-
-  console.log("[PACS] Final:", JSON.stringify({
-    left: finalWin.left, top: finalWin.top, width: finalWin.width, height: finalWin.height,
-  }));
-
-  // Defensa contra el resize tardio de Synapse.
-  scheduleSettleChecks(targetWindowId, bounds);
-
-  repositionedWindows.add(targetWindowId);
-  console.log("[PACS] Done (settle checks programados).");
 }
+
+async function checkLaunch(ref) {
+  const L = ref && state.launches[ref.tabId];
+  if (!L) return;
+  const tab = await getTab(L.tabId);
+  if (!tab) {
+    delete state.launches[L.tabId];
+    saveState();
+    return;
+  }
+  if (L.kind === "launcher" && isViewerUrl(tab.url)) {
+    finishLaunch(L, "la lanzadera abrió el visor");
+    return;
+  }
+  const now = Date.now();
+  if (L.phase === "pending") {
+    if (L.kind === "launcher" && !L.warningAt && now - (L.navAt || L.startedAt) > T.launcherStuckMs) {
+      await retryLaunch(L, "la lanzadera no avanzó");
+    }
+  } else if (L.phase === "awaiting-delivery") {
+    for (const id of L.deliveryTabs || []) {
+      const act = await getActivity(id);
+      if (looksDelivered(act, L.deliverySince || L.startedAt)) {
+        await closeLaunchTab(L, "el estudio se abrió en el visor existente");
+        finishLaunch(L, `entregado al visor existente (pestaña ${id})`);
+        return;
+      }
+    }
+    if (now >= (L.deliveryDeadline || 0)) {
+      log("warn", "El visor existente no recibió el estudio: se considera zombie y se cierra.");
+      for (const id of L.deliveryTabs || []) await closeTabSmart(id, "visor zombie (no recibió el estudio)");
+      await retryLaunch(L, "el visor existente no respondió");
+    }
+  } else if (L.phase === "retrying" && now >= (L.retryAt || 0)) {
+    Object.assign(L, { phase: "pending", navAt: now, warningAt: null, retryAt: null });
+    saveState();
+    log("info", `Reintento ${L.attempt}/${T.launchMaxAttempts}: recargando la ${L.kind === "viewer" ? "ventana del visor" : "lanzadera"}.`);
+    await chrome.tabs.reload(L.tabId).catch((e) => log("warn", "No pude recargar.", String(e)));
+  }
+}
+
+async function retryLaunch(L, reason) {
+  if (!L || L.phase === "retrying" || L.phase === "failed") return;
+  if ((L.attempt || 1) >= T.launchMaxAttempts) {
+    L.phase = "failed";
+    saveState();
+    log("error", `No se pudo abrir el estudio tras ${L.attempt} intentos: ${reason}.`);
+    const text =
+      `No se pudo abrir el estudio (${reason}). Cierra esta ventana y vuelve a hacer click en el estudio. ` +
+      "Si se repite, cierra todas las ventanas de Synapse.";
+    noticeTab(L.tabId, "error", text, { sticky: true, key: "launch-failed" });
+    noticeOtherSynapseTabs("error", "Synapse no abrió el último estudio. Vuelve a hacer click en él.", { key: "launch-failed" });
+    setAlert("launch", "error", "El último estudio no se pudo abrir.");
+    return;
+  }
+  L.attempt = (L.attempt || 1) + 1;
+  L.phase = "retrying";
+  L.retryAt = Date.now() + (T.retryDelayMs[L.attempt - 1] || 3000);
+  saveState();
+  log("warn", `Reintentando abrir el estudio (${L.attempt}/${T.launchMaxAttempts}): ${reason}.`);
+  noticeTab(L.tabId, "info", `Reintentando abrir el estudio (${L.attempt}/${T.launchMaxAttempts})…`, { key: "launch-retry" });
+  setTimeout(() => track(checkLaunch(L)), Math.max(0, L.retryAt - Date.now()) + 20);
+}
+
+// =====================================================================
+// Salud del visor (pantalla negra) y verificacion de escala/tamano
+// =====================================================================
+async function recoverViewer(tabId, reason, opts) {
+  opts = opts || {};
+  const rec = state.managed[tabId] || upsertManaged(tabId, {});
+  const now = Date.now();
+  // "En uso": hubo clicks/teclas/rueda en este estudio (en cualquier frame).
+  const inUse = !!opts.hasInput || (rec.inputAt || 0) > (rec.navAt || 0);
+  const canAuto =
+    settings.autoReload &&
+    !inUse &&
+    (rec.autoReloads || 0) < T.maxAutoReloads &&
+    (opts.force || !rec.lastAutoReloadAt || now - rec.lastAutoReloadAt > T.reloadCooldownMs);
+  if (canAuto) {
+    upsertManaged(tabId, { autoReloads: (rec.autoReloads || 0) + 1, lastAutoReloadAt: now });
+    log("warn", `Recargando el visor automáticamente: ${reason}.`);
+    if (!opts.silent) noticeTab(tabId, "warn", `${reason}. Recargando el visor…`, { key: "recover" });
+    await delay(900);
+    await chrome.tabs.reload(tabId).catch((e) => log("warn", "No pude recargar el visor.", String(e)));
+  } else {
+    log("warn", `Visor con problema (aviso al usuario): ${reason}.`);
+    noticeTab(tabId, "error", `${reason}.`, {
+      sticky: true,
+      key: "recover",
+      actions: [
+        { id: "reload", label: "Recargar visor" },
+        { id: "reposition", label: "Reubicar ventana" },
+      ],
+    });
+  }
+}
+
+async function onViewerHealth(tabId, msg) {
+  log("warn", `Salud del visor: ${msg.issue}.`, msg);
+  if (msg.issue === "webgl-lost") {
+    await recoverViewer(tabId, "El visor perdió el contexto gráfico (pantalla negra)", { hasInput: msg.hasInput });
+  } else if (msg.issue === "http-error") {
+    if (msg.status >= 500) {
+      await recoverViewer(tabId, `El servidor respondió con error (HTTP ${msg.status})`, { hasInput: msg.hasInput });
+    } else {
+      noticeTab(tabId, "error", `El visor respondió HTTP ${msg.status} (¿sesión expirada?). Vuelve a abrir el estudio desde la worklist.`, {
+        sticky: true,
+        key: "http",
+      });
+    }
+  }
+}
+
+async function onViewerReport(tabId, rep, sender) {
+  if (!rep || !rep.now) return;
+  const rec = upsertManaged(tabId, {
+    windowId: sender.tab.windowId,
+    reportAt: Date.now(),
+    report: {
+      dpr: rep.now.dpr,
+      startDpr: rep.start && rep.start.dpr,
+      size: [rep.now.iw, rep.now.ih],
+      changes: rep.changes,
+      media: rep.media,
+      blockedCalls: rep.blockedCalls,
+      hasInput: rep.hasInput,
+    },
+  });
+  const zoom = await chrome.tabs.getZoom(tabId).catch(() => 1);
+  const osScale = rep.now.dpr / (zoom || 1);
+
+  if (Math.abs(zoom - 1) > 0.005) {
+    if (settings.forceZoom100) await ensureZoom100(tabId, "informe del visor");
+    else warnOnce(`zoom:${pct(zoom)}`, tabId, "warn", `El zoom del navegador está en ${pct(zoom)}; Synapse exige 100% para medir bien (Ctrl+0).`);
+  }
+  if (Math.abs(osScale - 1) > 0.01) {
+    const text =
+      `Windows tiene la escala de pantalla en ${pct(osScale)} en el monitor del visor. Synapse exige 100% para que ` +
+      "las mediciones y el True Size sean correctos (Configuración → Sistema → Pantalla → Escala).";
+    warnOnce(`scale:${pct(osScale)}`, tabId, "error", text);
+    setAlert("scale", "error", `Escala de Windows ${pct(osScale)} en el monitor del visor (debe ser 100%).`);
+  } else {
+    clearAlert("scale");
+  }
+
+  if (rep.dprChangedAfterDcl) {
+    await recoverViewer(tabId, "La escala del visor cambió después de abrir el estudio: las mediciones podrían ser erróneas", {
+      hasInput: rep.hasInput,
+    });
+    return;
+  }
+  if (rep.dprChanged) log("info", "La escala cambió antes de que el visor terminara de iniciar (sin riesgo).", rep.changes);
+
+  const distorted = rep.media && rep.media.distorted > 0;
+  if ((rep.sizeChangedAfterDcl || distorted) && (rec.relayouts || 0) < 2) {
+    upsertManaged(tabId, { relayouts: (rec.relayouts || 0) + 1 });
+    log("info", distorted ? "Imagen deformada en el visor: pidiendo a Synapse que recalcule el layout." : "El visor cambió de tamaño tras iniciar: recalculando layout.");
+    chrome.tabs.sendMessage(tabId, { type: "pacs-dm:relayout" }, { frameId: 0 }).catch(() => {});
+  } else if (distorted) {
+    noticeTab(tabId, "warn", "La imagen del visor se ve deformada (no se ajustó al tamaño de la ventana). Recarga el visor antes de medir.", {
+      sticky: true,
+      key: "distorted",
+      actions: [{ id: "reload", label: "Recargar visor" }],
+    });
+  }
+
+  if (rec.target && settings.placeViewer && Date.now() <= (rec.guardUntil || 0)) {
+    const w = await chrome.windows.get(rec.windowId).catch(() => null);
+    if (w && G.boundsDelta(w, rec.target.bounds) > T.guardDriftPx) await applyBounds(rec.windowId, rec.target.bounds, "verificación");
+  }
+}
+
+// =====================================================================
+// Reubicacion manual (atajo Ctrl+Shift+Y o click en el icono)
+// =====================================================================
+chrome.commands.onCommand.addListener((command) => {
+  if (command === "reposition-viewer") track(repositionViewerNow("atajo"));
+});
+chrome.action.onClicked.addListener(() => track(repositionViewerNow("icono")));
+
+async function repositionViewerNow(source, preferTabId) {
+  await ready;
+  const tabs = await findViewerTabs();
+  if (!tabs.length) {
+    log("warn", `No hay ningún visor abierto para reubicar (${source}).`);
+    return { ok: false, reason: "no-viewer" };
+  }
+  let tab = tabs.find((t) => t.id === preferTabId);
+  if (!tab) {
+    const focused = await chrome.windows.getLastFocused().catch(() => null);
+    tab = (focused && tabs.find((t) => t.windowId === focused.id)) || mostRecentViewer(tabs);
+  }
+  displayCache = null;
+  const target = await computeTarget();
+  if (!target) {
+    noticeTab(tab.id, "warn", "No encontré los monitores externos para el visor.", { key: "manual" });
+    return { ok: false, reason: "no-displays" };
+  }
+  let windowId = tab.windowId;
+  const win = await chrome.windows.get(windowId).catch(() => null);
+  if (win && win.type === "normal") {
+    const created = await chrome.windows.create({ tabId: tab.id, type: "popup", focused: true, ...target.bounds });
+    windowId = created.id;
+  }
+  upsertManaged(tab.id, {
+    role: "viewer",
+    windowId,
+    target: { bounds: target.bounds, displayIds: target.displayIds, names: target.names, scales: target.scales },
+    guardUntil: Date.now() + settings.guardSeconds * 1000,
+    reapplies: 0,
+    relayouts: 0,
+  });
+  log("info", `Reubicación manual del visor (${source}).`);
+  const res = await applyBounds(windowId, target.bounds, `manual (${source})`);
+  await ensureZoom100(tab.id, "manual");
+  chrome.tabs.sendMessage(tab.id, { type: "pacs-dm:relayout" }, { frameId: 0 }).catch(() => {});
+  noticeTab(
+    tab.id,
+    res.ok ? "info" : "warn",
+    res.ok ? "Visor reubicado en los monitores externos." : "No pude dejar el visor exactamente en su lugar (ver diagnóstico en Opciones).",
+    { key: "manual" }
+  );
+  return { ok: res.ok, delta: res.delta };
+}
+
+// =====================================================================
+// Mensajes (content scripts y pagina de Opciones)
+// =====================================================================
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || typeof msg.type !== "string" || !msg.type.startsWith("pacs-dm:")) return;
+  handleMessage(msg, sender).then(
+    (res) => sendResponse(res === undefined ? { ok: true } : res),
+    (e) => {
+      log("error", `Error procesando ${msg.type}`, String((e && e.stack) || e));
+      sendResponse({ ok: false, error: String(e) });
+    }
+  );
+  return true;
+});
+
+const pageEventCount = new Map();
+
+async function handleMessage(msg, sender) {
+  await ready;
+  const tabId = sender.tab ? sender.tab.id : null;
+  if (tabId != null && sender.frameId === 0) flushPendingNotices(tabId);
+  switch (msg.type) {
+    case "pacs-dm:warning":
+    case "pacs-dm:heartbeat": {
+      if (tabId == null) return;
+      let L = state.launches[tabId];
+      const docStart = Date.now() - (msg.age || 0);
+      // Un intento viejo o ya fallido no debe bloquear un aviso nuevo (otra
+      // pagina, o el aviso que vuelve a aparecer en la worklist): de cero.
+      const stale =
+        L &&
+        (Date.now() - (L.startedAt || 0) > 300000 ||
+          ((L.phase === "failed" || L.phase === "warning") &&
+            (docStart > (L.warningAt || 0) + 300 ||
+              (msg.type === "pacs-dm:warning" && Date.now() - (L.warningAt || 0) > 10000))));
+      if (stale) {
+        delete state.launches[tabId];
+        L = null;
+      }
+      // Latido tardio del documento anterior a una recarga nuestra: ignorar.
+      if (L && L.navAt && docStart < L.navAt - 300) return;
+      if (!L) {
+        if (msg.type === "pacs-dm:heartbeat" && msg.role === "launcher" && !msg.warning) {
+          const t0 = Date.now() - (msg.age || 0);
+          L = state.launches[tabId] = { tabId, kind: "launcher", startedAt: t0, navAt: t0, attempt: 1, phase: "pending" };
+        } else if (msg.type === "pacs-dm:warning" || msg.warning) {
+          L = state.launches[tabId] = { tabId, kind: msg.role, startedAt: Date.now(), navAt: Date.now(), attempt: 1, phase: "pending" };
+        } else {
+          return;
+        }
+        saveState();
+      }
+      if ((msg.type === "pacs-dm:warning" || msg.warning) && !L.warningAt && L.phase === "pending") {
+        if (msg.sample) log("info", `Texto del aviso: "${msg.sample}"`);
+        await handleWarning(L);
+      }
+      await checkLaunch(L);
+      return;
+    }
+    case "pacs-dm:viewer-start": {
+      if (tabId == null) return;
+      upsertManaged(tabId, { startDpr: msg.start && msg.start.dpr });
+      if (msg.start && Math.abs(msg.start.dpr - 1) > 0.01) {
+        log("info", `El visor nació con escala ${pct(msg.start.dpr)} (devicePixelRatio).`);
+      }
+      return;
+    }
+    case "pacs-dm:viewer-report":
+      if (tabId != null) await onViewerReport(tabId, msg.report, sender);
+      return;
+    case "pacs-dm:viewer-health":
+      if (tabId != null) await onViewerHealth(tabId, msg);
+      return;
+    case "pacs-dm:viewer-input":
+      if (tabId != null && state.managed[tabId]) upsertManaged(tabId, { inputAt: Date.now() });
+      return;
+    case "pacs-dm:page-event": {
+      if (tabId == null || !msg.event) return;
+      const n = (pageEventCount.get(tabId) || 0) + 1;
+      pageEventCount.set(tabId, n);
+      const ev = msg.event;
+      if (ev.type === "dialog" && /zoom/i.test(ev.message || "")) {
+        log("warn", `Synapse avisó sobre el zoom: "${ev.message}"`);
+        await ensureZoom100(tabId, "aviso de Synapse");
+        noticeTab(tabId, "warn", "Synapse avisó que el zoom no estaba en 100%. Ya quedó en 100%: recarga el visor antes de medir.", {
+          sticky: true,
+          key: "zoom-alert",
+          actions: [{ id: "reload", label: "Recargar visor" }],
+        });
+      } else if (n <= 15) {
+        if (ev.type === "window-call") {
+          log("info", `Synapse intentó ${ev.name}(${(ev.args || []).join(", ")})${ev.blocked ? " — bloqueado" : ""}`);
+        } else if (ev.type === "dialog") {
+          // El texto de otros alert() podria traer datos del paciente: no se guarda.
+          log("info", `Synapse mostró un ${ev.name}().`);
+        } else {
+          const safe = {};
+          for (const [k, v] of Object.entries(ev)) safe[k] = typeof v === "string" ? maskIds(v) : v;
+          log("warn", `Página: ${ev.type}`, safe);
+        }
+      }
+      return;
+    }
+    case "pacs-dm:action": {
+      if (tabId == null) return;
+      if (msg.id === "reload") {
+        log("info", "Recarga del visor pedida desde el aviso.");
+        await chrome.tabs.reload(tabId);
+      } else if (msg.id === "reposition") {
+        await repositionViewerNow("aviso", tabId);
+      } else if (msg.id === "options") {
+        await chrome.runtime.openOptionsPage();
+      }
+      return;
+    }
+    case "pacs-dm:status":
+      return getStatus();
+    case "pacs-dm:reposition":
+      return repositionViewerNow("opciones");
+    case "pacs-dm:clear-log":
+      await clearLog();
+      state.warned = {};
+      state.alerts = {};
+      saveState();
+      refreshBadge();
+      return;
+    default:
+      return;
+  }
+}
+
+async function getStatus() {
+  await flushLog();
+  const displays = await getDisplays(true);
+  const pick = G.pickViewerDisplays(displays, {
+    displayIds: settings.displayIds,
+    singleMonitorFallback: settings.singleMonitorFallback,
+  });
+  const managed = [];
+  for (const rec of Object.values(state.managed)) {
+    const w = rec.windowId != null ? await chrome.windows.get(rec.windowId).catch(() => null) : null;
+    const zoom = await chrome.tabs.getZoom(rec.tabId).catch(() => null);
+    managed.push(Object.assign({}, rec, { current: box(w), zoom }));
+  }
+  const { log: entries = [] } = await chrome.storage.session.get("log");
+  return {
+    version: chrome.runtime.getManifest().version,
+    settings,
+    defaults: DEFAULT_SETTINGS,
+    displays,
+    pick: pick && {
+      ids: pick.displays.map((d) => d.id),
+      reason: pick.reason,
+      warnings: pick.warnings,
+      bounds: G.targetBounds(pick.displays, settings.invisibleBorder),
+    },
+    managed,
+    launches: Object.values(state.launches),
+    alerts: state.alerts,
+    log: entries,
+  };
+}
+
+// =====================================================================
+// Instalacion / actualizacion
+// =====================================================================
+chrome.runtime.onInstalled.addListener((details) => {
+  track(
+    (async () => {
+      await ready;
+      // Adoptar visores ya abiertos (p.ej. tras actualizar la extension).
+      for (const t of await findViewerTabs()) {
+        if (!state.managed[t.id]) upsertManaged(t.id, { role: "viewer", windowId: t.windowId, path: shortUrl(t.url), navKey: urlKey(t.url), navAt: Date.now() });
+      }
+      refreshBadge();
+      log("info", `Extensión ${details.reason === "install" ? "instalada" : "actualizada"} (v${chrome.runtime.getManifest().version}).`);
+    })()
+  );
+});
+
+chrome.runtime.onStartup.addListener(() => track(ready.then(refreshBadge)));

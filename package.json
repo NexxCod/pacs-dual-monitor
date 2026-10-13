@@ -1,0 +1,13 @@
+{
+  "name": "pacs-dual-monitor",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Pruebas de la extensión PACS Dual Monitor (la extensión no necesita npm para funcionar).",
+  "scripts": {
+    "test": "node --test tests/geometry.test.js",
+    "test:e2e": "xvfb-run -a -s \"-screen 0 5760x1200x24\" node --test --test-reporter=spec tests/e2e/extension.e2e.js"
+  },
+  "devDependencies": {
+    "playwright": "1.56.1"
+  }
+}
