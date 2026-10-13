@@ -16,15 +16,37 @@
 
 (() => {
   "use strict";
-  if (window.__pacsDmContent) return;
-  window.__pacsDmContent = true;
+  // Una sola instancia viva por pagina. Al actualizar la extension, la
+  // instancia anterior queda desconectada y se vuelve a inyectar esta.
+  try {
+    if (window.__pacsDmAlive && window.__pacsDmAlive()) return;
+  } catch (e) { /* instancia anterior invalida */ }
+  window.__pacsDmAlive = () => {
+    try {
+      return !!chrome.runtime.id;
+    } catch (e) {
+      return false;
+    }
+  };
 
   const isTop = window === window.top;
   const where = location.pathname + location.search + location.hash;
   const IS_VIEWER = /\/ImageViewer\/layout/i.test(where);
   const IS_LAUNCHER = /\/WebQuery\/Index/i.test(where) && /winpass=true/i.test(where);
+  // En un iframe, el rol lo define la pagina principal (si es del mismo origen).
+  let topWhere = where;
+  if (!isTop) {
+    try {
+      const t = window.top.location;
+      topWhere = t.pathname + t.search + t.hash;
+    } catch (e) { /* frame de otro origen */ }
+  }
+  const TOP_VIEWER = /\/ImageViewer\/layout/i.test(topWhere);
+  const TOP_LAUNCHER = /\/WebQuery\/Index/i.test(topWhere) && /winpass=true/i.test(topWhere);
   const WARNING_RE = /abierta en otra ventana|open in another window/i;
   const pageStart = Date.now();
+  // Inicio real del documento (reloj absoluto), aunque el script se inyecte tarde.
+  const docStart = Math.round(performance.timeOrigin || pageStart);
 
   const DEFAULTS = { blockPageResize: true, forceZoom100: true, showNotices: true };
   let settings = Object.assign({}, DEFAULTS);
@@ -180,7 +202,7 @@
   }
 
   function role() {
-    return IS_LAUNCHER ? "launcher" : IS_VIEWER ? "viewer" : "other";
+    return TOP_LAUNCHER ? "launcher" : TOP_VIEWER ? "viewer" : "other";
   }
 
   function startHeartbeat() {
@@ -189,7 +211,7 @@
     const beat = () => {
       hbTimer = null;
       if (Date.now() - hbStart > 90000) return;
-      send({ type: "pacs-dm:heartbeat", role: role(), warning: warningVisible(), age: Date.now() - pageStart });
+      send({ type: "pacs-dm:heartbeat", role: role(), warning: warningVisible(), docStart });
       hbTimer = setTimeout(beat, 1500);
     };
     hbTimer = setTimeout(beat, 400);
@@ -223,10 +245,12 @@
         type: "pacs-dm:warning",
         role: role(),
         frame: isTop ? "top" : "sub",
-        age: Date.now() - pageStart,
+        docStart,
         sample: m ? m[0].trim().slice(0, 160) : "",
       });
-      startHeartbeat();
+      // Los latidos sirven para seguir el reintento de la lanzadera o del
+      // visor; en la worklist no hacen falta.
+      if (role() !== "other") startHeartbeat();
     }
     function schedule() {
       if (!timer) timer = setTimeout(check, Math.max(0, interval - (Date.now() - last)));
@@ -242,13 +266,7 @@
   // ===================================================================
   // Zoom accidental del navegador (Ctrl+rueda, Ctrl +/-) en el visor
   // ===================================================================
-  let inViewer = IS_VIEWER;
-  if (!isTop) {
-    try {
-      const t = window.top.location;
-      inViewer = /\/ImageViewer\/layout/i.test(t.pathname + t.search + t.hash);
-    } catch (e) { /* frame de otro origen */ }
-  }
+  const inViewer = TOP_VIEWER;
   let inputAt = 0;
   let inputSentAt = 0;
   // Cualquier uso del visor (tambien dentro de iframes) se informa al
@@ -346,15 +364,17 @@
       sh: screen.height,
     });
     const start = snap();
-    let dcl = null;
-    let load = null;
+    // Si el script se inyecto con la pagina ya cargada (tras actualizar la
+    // extension), el visor ya inicio: los cambios desde ahora son "despues".
+    let dcl = document.readyState !== "loading" ? start : null;
+    let load = document.readyState === "complete" ? start : null;
     let last = start;
     const changes = [];
     let blockedCalls = 0;
     let reportTimer = null;
     // Actividad con marcas de tiempo: permite saber si llego un estudio
     // despues de un instante dado, sin carreras con la entrega.
-    const activity = { docStartedAt: pageStart, titleChangedAt: 0, hrefChangedAt: 0, mutations: 0, recent: [] };
+    const activity = { docStartedAt: docStart, titleChangedAt: 0, hrefChangedAt: 0, mutations: 0, recent: [] };
     let lastTitle = document.title;
     let lastHref = location.href;
     function watchIdentity() {
@@ -429,6 +449,7 @@
       },
       { once: true }
     );
+    if (dcl) checkHttpStatus();
     // Si "load" nunca llega (recurso colgado), informar igual.
     setTimeout(() => {
       if (!load) scheduleReport(0, true);
@@ -568,7 +589,7 @@
           sendResponse({ ok: true });
           return;
         case "pacs-dm:get-activity":
-          sendResponse(viewer ? viewer.activity() : { docStartedAt: pageStart, inputAt, visibility: document.visibilityState });
+          sendResponse(viewer ? viewer.activity() : { docStartedAt: docStart, inputAt, visibility: document.visibilityState });
           return;
         case "pacs-dm:get-report":
           sendResponse(viewer ? viewer.report() : null);

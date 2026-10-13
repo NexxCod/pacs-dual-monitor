@@ -61,6 +61,7 @@ const T = {
   launchMaxAttempts: 3,
   retryDelayMs: [0, 1200, 3000, 5000],
   activityTimeoutMs: 1500,
+  inUseMs: 5000, // un visor con uso en estos ms no se cierra como huerfano
   reloadCooldownMs: 120000,
   maxAutoReloads: 2,
 };
@@ -359,23 +360,40 @@ async function onDisplaysSettled() {
   if (!target) return;
   for (const rec of Object.values(state.managed)) {
     const tab = await getTab(rec.tabId);
-    if (!tab) continue;
+    // Solo visores/lanzaderas: nunca la worklist ni otras paginas.
+    if (!tab || !(isViewerUrl(tab.url) || isLauncherUrl(tab.url))) continue;
+    const win = await chrome.windows.get(tab.windowId).catch(() => null);
+    if (!win) continue;
     // Al apagarse/encenderse un monitor Windows mueve las ventanas al
     // principal: se compara con donde ESTA la ventana, no con el destino viejo.
-    const win = await chrome.windows.get(tab.windowId).catch(() => null);
-    if (!win || G.boundsDelta(win, target.bounds) <= T.exactPx) {
-      upsertManaged(rec.tabId, { target: Object.assign({}, rec.target, { bounds: target.bounds }) });
+    if (win.type === "popup" && G.boundsDelta(win, target.bounds) <= T.exactPx) {
+      upsertManaged(rec.tabId, { target: targetInfo(target) });
       continue;
     }
-    upsertManaged(rec.tabId, {
-      windowId: tab.windowId,
-      target: { bounds: target.bounds, displayIds: target.displayIds, names: target.names, scales: target.scales },
-      guardUntil: Date.now() + 5000,
-      reapplies: 0,
-    });
     log("info", "Reubicando el visor por cambio de monitores.", { ahora: box(win), destino: target.bounds });
-    await applyBounds(tab.windowId, target.bounds, "cambio de monitores");
+    await placeTab(tab, target, "cambio de monitores", { guardUntil: Date.now() + 5000, reapplies: 0, userMovedAt: 0 });
   }
+}
+
+function targetInfo(target) {
+  return { bounds: target.bounds, displayIds: target.displayIds, names: target.names, scales: target.scales };
+}
+
+// Ubica una pestana de visor ya abierta (sin tocar sus datos de navegacion):
+// si esta en una ventana normal la pasa a un popup creado en su lugar.
+async function placeTab(tab, target, why, extra) {
+  let windowId = tab.windowId;
+  const win = await chrome.windows.get(windowId).catch(() => null);
+  if (!win) return { ok: false };
+  if (win.type === "normal") {
+    const created = await chrome.windows.create({ tabId: tab.id, type: "popup", focused: true, ...target.bounds });
+    windowId = created.id;
+    log("info", `Pestaña ${tab.id} sacada de la ventana normal ${win.id} a un popup (${windowId}).`);
+  } else if (win.type !== "popup") {
+    return { ok: false };
+  }
+  upsertManaged(tab.id, Object.assign({ windowId, target: targetInfo(target) }, extra || {}));
+  return applyBounds(windowId, target.bounds, why);
 }
 
 // =====================================================================
@@ -487,6 +505,7 @@ async function doPrepare(tabId, url, role, why) {
     navAt: now,
     guardUntil: now + T.guardBeforeLoadMs,
     reapplies: 0,
+    userMovedAt: 0,
     loadedAt: null,
     report: null,
     relayouts: 0,
@@ -521,10 +540,7 @@ async function doPrepare(tabId, url, role, why) {
     log("info", `Ventana ${windowId} de tipo "${win.type}": no se toca.`);
     return rec;
   }
-  rec = upsertManaged(tabId, {
-    windowId,
-    target: { bounds: target.bounds, displayIds: target.displayIds, names: target.names, scales: target.scales },
-  });
+  rec = upsertManaged(tabId, { windowId, target: targetInfo(target) });
   await applyBounds(windowId, target.bounds, why);
   target.warnings.forEach((text, i) => warnOnce(`display:${text}`, tabId, "warn", text, { key: `display-${i}` }));
   return rec;
@@ -571,6 +587,14 @@ chrome.tabs.onZoomChange.addListener((info) => {
 function isPrerender(d) {
   return d.documentLifecycle === "prerender" || d.tabId < 0;
 }
+
+// Pestanas/ventanas creadas por window.open (lanzaderas nuevas). Se anota de
+// inmediato, sin await, para no perder la carrera con onBeforeNavigate.
+const createdTargets = new Map();
+chrome.webNavigation.onCreatedNavigationTarget.addListener((d) => {
+  createdTargets.set(d.tabId, Date.now());
+  if (createdTargets.size > 50) createdTargets.delete(createdTargets.keys().next().value);
+}, NAV_FILTER);
 
 chrome.webNavigation.onBeforeNavigate.addListener((d) => {
   if (d.frameId !== 0 || isPrerender(d)) return;
@@ -656,6 +680,7 @@ chrome.tabs.onAttached.addListener((tabId, info) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   pendingNotices.delete(tabId);
   pageEventCount.delete(tabId);
+  createdTargets.delete(tabId);
   track(
     (async () => {
       await ready;
@@ -683,7 +708,7 @@ chrome.windows.onBoundsChanged.addListener((win) => track(onBoundsChanged(win)))
 async function onBoundsChanged(win) {
   await ready;
   const rec = managedByWindow(win.id);
-  if (!rec || !rec.target || !settings.placeViewer || isOwn(win.id)) return;
+  if (!rec || !rec.target || !settings.placeViewer || win.type !== "popup" || isOwn(win.id)) return;
   const delta = G.boundsDelta(win, rec.target.bounds);
   if (delta <= T.guardDriftPx) return;
   const now = Date.now();
@@ -738,16 +763,39 @@ async function closeTabSmart(tabId, why) {
   }
 }
 
-async function cleanupOrphans(keepTabId) {
-  if (!settings.closeOrphanViewers) return;
+// En fila (dos visores que abren a la vez no deben cerrarse mutuamente) y
+// conservando siempre el visor MAS RECIENTE, no el que disparo el evento.
+let cleanupChain = Promise.resolve();
+function cleanupOrphans(triggerTabId) {
+  if (!settings.closeOrphanViewers) return Promise.resolve();
+  cleanupChain = cleanupChain
+    .then(() => doCleanupOrphans(triggerTabId))
+    .catch((e) => log("warn", "Error al cerrar visores huérfanos.", String(e)));
+  return cleanupChain;
+}
+
+async function doCleanupOrphans(triggerTabId) {
   const viewers = await findViewerTabs();
+  const keep = viewers.length ? mostRecentViewer(viewers) : null;
   for (const t of viewers) {
-    if (t.id === keepTabId) continue;
+    if (keep && t.id === keep.id) continue;
+    // Un visor que estas usando en este momento no se cierra solo.
+    const act = await getActivity(t.id);
+    const rec = state.managed[t.id];
+    const lastInput = Math.max((act && act.inputAt) || 0, (rec && rec.inputAt) || 0);
+    if (Date.now() - lastInput < T.inUseMs) {
+      log("info", `Visor anterior en uso (pestaña ${t.id}): no se cierra.`);
+      noticeTab(t.id, "warn", "Se abrió otro visor. Este quedó abierto porque lo estabas usando: ciérralo cuando termines.", {
+        sticky: true,
+        key: "orphan-kept",
+      });
+      continue;
+    }
     await closeTabSmart(t.id, "visor anterior/huérfano");
   }
   // Lanzaderas de intentos anteriores que quedaron pegadas.
   for (const L of Object.values(state.launches)) {
-    if (L.tabId !== keepTabId && (L.phase === "failed" || L.phase === "awaiting-delivery")) {
+    if (L.tabId !== triggerTabId && (L.phase === "failed" || isAwaiting(L))) {
       await closeTabSmart(L.tabId, "lanzadera pegada de un intento anterior");
       delete state.launches[L.tabId];
       saveState();
@@ -775,8 +823,14 @@ async function onLauncherStart(tabId, url, navTime) {
   saveState();
   // Ubicar desde ya la ventana de la lanzadera (sera la ventana del visor), asi
   // el visor nace con el tamano y la escala finales. Solo si es una pestana o
-  // ventana nueva: nunca se mueve la ventana de la worklist.
-  const fresh = !tab.url || tab.url === "about:blank" || isLauncherUrl(tab.url) || isViewerUrl(tab.url);
+  // ventana nueva (abierta por window.open, un popup propio, o una ventana que
+  // ya gestionamos): nunca se mueve la ventana de la worklist.
+  const win = await chrome.windows.get(tab.windowId, { populate: true }).catch(() => null);
+  const rec = state.managed[tabId];
+  const fresh =
+    createdTargets.has(tabId) ||
+    !!(rec && rec.target) ||
+    !!(win && win.type === "popup" && (win.tabs || []).length === 1);
   if (fresh && settings.placeLauncher) await prepareWindow(tabId, url, "launcher", "lanzadera");
 }
 
@@ -787,7 +841,7 @@ async function onViewerCommitted(tabId) {
   if (L && L.kind === "launcher") finishLaunch(L, "la lanzadera abrió el visor");
   // Lanzaderas que esperaban que el estudio llegara a este visor.
   for (const other of Object.values(state.launches)) {
-    if (other.tabId === tabId || other.phase !== "awaiting-delivery") continue;
+    if (other.tabId === tabId || !isAwaiting(other)) continue;
     if ((other.deliveryTabs || []).includes(tabId)) {
       await closeLaunchTab(other, "el estudio se abrió en el visor existente");
       finishLaunch(other, "entregado al visor existente (navegación)");
@@ -822,8 +876,12 @@ async function focusViewerTab(tab, why) {
     if (w.state === "minimized") await chrome.windows.update(w.id, { state: "normal" });
     await chrome.windows.update(w.id, { focused: true });
     if (!tab.active) await chrome.tabs.update(tab.id, { active: true });
+    // El estudio llega a un visor ya iniciado: no se le cambia el tamano si tu
+    // lo moviste a proposito (su calibracion corresponde a donde esta).
     const rec = state.managed[tab.id];
-    if (rec && rec.target && settings.placeViewer) await applyBounds(rec.windowId, rec.target.bounds, `traer al frente (${why})`);
+    if (rec && rec.target && settings.placeViewer && !rec.userMovedAt && w.type === "popup") {
+      await applyBounds(w.id, rec.target.bounds, `traer al frente (${why})`);
+    }
     log("info", `Visor existente traído al frente (pestaña ${tab.id}, ${why}).`);
   } catch (e) {
     log("warn", "No pude traer el visor al frente.", String(e));
@@ -852,10 +910,10 @@ function looksDelivered(act, since) {
 }
 
 async function handleWarning(L) {
+  L.warningAt = Date.now(); // antes de cualquier await: evita manejarlo dos veces
   const tab = await getTab(L.tabId);
   if (!tab) return;
   L.kind = isLauncherUrl(tab.url) ? "launcher" : isViewerUrl(tab.url) ? "viewer" : "other";
-  L.warningAt = Date.now();
   log("warn", `Synapse muestra "abierta en otra ventana" (${L.kind}, pestaña ${L.tabId}, intento ${L.attempt || 1}).`);
   if (!settings.launcherRecovery) {
     L.phase = "warning";
@@ -911,26 +969,72 @@ async function checkLaunch(ref) {
     if (L.kind === "launcher" && !L.warningAt && now - (L.navAt || L.startedAt) > T.launcherStuckMs) {
       await retryLaunch(L, "la lanzadera no avanzó");
     }
-  } else if (L.phase === "awaiting-delivery") {
+  } else if (L.phase === "awaiting-delivery" || L.phase === "awaiting-user") {
+    const since = L.deliverySince || L.startedAt;
+    let unknown = 0;
+    let inUse = false;
     for (const id of L.deliveryTabs || []) {
       const act = await getActivity(id);
-      if (looksDelivered(act, L.deliverySince || L.startedAt)) {
+      if (!isAwaiting(L)) return; // otro manejador ya cerro este intento
+      if (looksDelivered(act, since)) {
         await closeLaunchTab(L, "el estudio se abrió en el visor existente");
         finishLaunch(L, `entregado al visor existente (pestaña ${id})`);
         return;
       }
+      const rec = state.managed[id];
+      if ((act && (act.inputAt || 0) > since) || (rec && (rec.inputAt || 0) > since)) inUse = true;
+      if (!act && (await getTab(id))) unknown++;
     }
-    if (now >= (L.deliveryDeadline || 0)) {
-      log("warn", "El visor existente no recibió el estudio: se considera zombie y se cierra.");
-      for (const id of L.deliveryTabs || []) await closeTabSmart(id, "visor zombie (no recibió el estudio)");
-      await retryLaunch(L, "el visor existente no respondió");
+    if (inUse) {
+      // Lo estas usando: no es un zombie y nunca se cierra solo.
+      await closeLaunchTab(L, "el visor existente está en uso");
+      finishLaunch(L, "visor existente en uso");
+      noticeOtherSynapseTabs("info", "Synapse envió el estudio al visor que estás usando. Si no aparece, vuelve a hacer click en el estudio.", {
+        key: "in-use",
+      });
+      return;
     }
+    if (L.phase === "awaiting-user" || now < (L.deliveryDeadline || 0)) return;
+    if (unknown && !L.extended) {
+      // El visor no contesto la consulta (p.ej. un alert() abierto): esperar
+      // una vez mas antes de decidir.
+      L.extended = true;
+      L.deliveryDeadline = now + T.deliveryWaitMs;
+      saveState();
+      log("info", "El visor existente no contestó la consulta; espero un poco más.");
+      setTimeout(() => track(checkLaunch(L)), T.deliveryWaitMs + 50);
+      return;
+    }
+    if (unknown || !settings.closeOrphanViewers) {
+      // Sin certeza (o con el cierre de visores desactivado): decides tu.
+      L.phase = "awaiting-user";
+      saveState();
+      log("warn", "No pude confirmar que el visor existente recibiera el estudio: se pregunta al usuario.");
+      const text = "El visor abierto no parece haber recibido el estudio. ¿Cerrarlo y volver a abrir el estudio?";
+      const opts = { sticky: true, key: "zombie-ask", actions: [{ id: `retry-launch:${L.tabId}`, label: "Cerrar visor y reintentar" }] };
+      noticeTab(L.tabId, "warn", text, opts);
+      noticeOtherSynapseTabs("warn", text, opts);
+      for (const id of L.deliveryTabs || []) noticeTab(id, "warn", text, opts);
+      return;
+    }
+    log("warn", "El visor existente no recibió el estudio: se considera zombie y se cierra.");
+    for (const id of L.deliveryTabs || []) {
+      if (!isAwaiting(L)) return;
+      await closeTabSmart(id, "visor zombie (no recibió el estudio)");
+    }
+    if (isAwaiting(L)) await retryLaunch(L, "el visor existente no respondió");
   } else if (L.phase === "retrying" && now >= (L.retryAt || 0)) {
     Object.assign(L, { phase: "pending", navAt: now, warningAt: null, retryAt: null });
     saveState();
     log("info", `Reintento ${L.attempt}/${T.launchMaxAttempts}: recargando la ${L.kind === "viewer" ? "ventana del visor" : "lanzadera"}.`);
     await chrome.tabs.reload(L.tabId).catch((e) => log("warn", "No pude recargar.", String(e)));
   }
+}
+
+// El intento sigue vigente y esperando la entrega (nadie lo cerro mientras
+// esperabamos respuestas).
+function isAwaiting(L) {
+  return state.launches[L.tabId] === L && (L.phase === "awaiting-delivery" || L.phase === "awaiting-user");
 }
 
 async function retryLaunch(L, reason) {
@@ -954,6 +1058,21 @@ async function retryLaunch(L, reason) {
   log("warn", `Reintentando abrir el estudio (${L.attempt}/${T.launchMaxAttempts}): ${reason}.`);
   noticeTab(L.tabId, "info", `Reintentando abrir el estudio (${L.attempt}/${T.launchMaxAttempts})…`, { key: "launch-retry" });
   setTimeout(() => track(checkLaunch(L)), Math.max(0, L.retryAt - Date.now()) + 20);
+}
+
+// El usuario confirmo: cerrar el visor que no recibio el estudio y reintentar.
+async function userRetryLaunch(launchTabId, fromTabId) {
+  const L = state.launches[launchTabId];
+  if (!L || !(await getTab(L.tabId))) {
+    noticeTab(fromTabId, "info", "Vuelve a hacer click en el estudio en la worklist.", { key: "zombie-ask" });
+    return;
+  }
+  for (const id of L.deliveryTabs || []) await closeTabSmart(id, "visor cerrado por el usuario (no recibió el estudio)");
+  Object.assign(L, { phase: "pending", navAt: Date.now(), warningAt: null, retryAt: null, extended: false });
+  L.attempt = (L.attempt || 1) + 1;
+  saveState();
+  log("info", "Reintento pedido por el usuario.");
+  await chrome.tabs.reload(L.tabId).catch(() => {});
 }
 
 // =====================================================================
@@ -1090,22 +1209,14 @@ async function repositionViewerNow(source, preferTabId) {
     noticeTab(tab.id, "warn", "No encontré los monitores externos para el visor.", { key: "manual" });
     return { ok: false, reason: "no-displays" };
   }
-  let windowId = tab.windowId;
-  const win = await chrome.windows.get(windowId).catch(() => null);
-  if (win && win.type === "normal") {
-    const created = await chrome.windows.create({ tabId: tab.id, type: "popup", focused: true, ...target.bounds });
-    windowId = created.id;
-  }
-  upsertManaged(tab.id, {
+  log("info", `Reubicación manual del visor (${source}).`);
+  const res = await placeTab(tab, target, `manual (${source})`, {
     role: "viewer",
-    windowId,
-    target: { bounds: target.bounds, displayIds: target.displayIds, names: target.names, scales: target.scales },
     guardUntil: Date.now() + settings.guardSeconds * 1000,
     reapplies: 0,
     relayouts: 0,
+    userMovedAt: 0,
   });
-  log("info", `Reubicación manual del visor (${source}).`);
-  const res = await applyBounds(windowId, target.bounds, `manual (${source})`);
   await ensureZoom100(tab.id, "manual");
   chrome.tabs.sendMessage(tab.id, { type: "pacs-dm:relayout" }, { frameId: 0 }).catch(() => {});
   noticeTab(
@@ -1143,15 +1254,16 @@ async function handleMessage(msg, sender) {
     case "pacs-dm:heartbeat": {
       if (tabId == null) return;
       let L = state.launches[tabId];
-      const docStart = Date.now() - (msg.age || 0);
+      // Inicio del documento que habla (reloj absoluto del mismo equipo).
+      const docStart = Number(msg.docStart) || Date.now() - (msg.age || 0);
+      const appeared = msg.type === "pacs-dm:warning";
       // Un intento viejo o ya fallido no debe bloquear un aviso nuevo (otra
       // pagina, o el aviso que vuelve a aparecer en la worklist): de cero.
       const stale =
         L &&
         (Date.now() - (L.startedAt || 0) > 300000 ||
           ((L.phase === "failed" || L.phase === "warning") &&
-            (docStart > (L.warningAt || 0) + 300 ||
-              (msg.type === "pacs-dm:warning" && Date.now() - (L.warningAt || 0) > 10000))));
+            (docStart > (L.warningAt || 0) + 300 || (appeared && Date.now() - (L.warningAt || 0) > 10000))));
       if (stale) {
         delete state.launches[tabId];
         L = null;
@@ -1159,17 +1271,15 @@ async function handleMessage(msg, sender) {
       // Latido tardio del documento anterior a una recarga nuestra: ignorar.
       if (L && L.navAt && docStart < L.navAt - 300) return;
       if (!L) {
-        if (msg.type === "pacs-dm:heartbeat" && msg.role === "launcher" && !msg.warning) {
-          const t0 = Date.now() - (msg.age || 0);
-          L = state.launches[tabId] = { tabId, kind: "launcher", startedAt: t0, navAt: t0, attempt: 1, phase: "pending" };
-        } else if (msg.type === "pacs-dm:warning" || msg.warning) {
-          L = state.launches[tabId] = { tabId, kind: msg.role, startedAt: Date.now(), navAt: Date.now(), attempt: 1, phase: "pending" };
-        } else {
-          return;
-        }
+        // Un intento nuevo solo nace con la APARICION del aviso, o con el
+        // latido de una lanzadera. Los latidos de otras paginas con el aviso
+        // aun visible no crean intentos (si no, el visor se traeria al frente
+        // una y otra vez mientras el aviso siga en pantalla).
+        if (!appeared && !(msg.role === "launcher" && msg.type === "pacs-dm:heartbeat")) return;
+        L = state.launches[tabId] = { tabId, kind: msg.role, startedAt: docStart, navAt: docStart, attempt: 1, phase: "pending" };
         saveState();
       }
-      if ((msg.type === "pacs-dm:warning" || msg.warning) && !L.warningAt && L.phase === "pending") {
+      if ((appeared || msg.warning) && !L.warningAt && L.phase === "pending") {
         if (msg.sample) log("info", `Texto del aviso: "${msg.sample}"`);
         await handleWarning(L);
       }
@@ -1229,6 +1339,8 @@ async function handleMessage(msg, sender) {
         await repositionViewerNow("aviso", tabId);
       } else if (msg.id === "options") {
         await chrome.runtime.openOptionsPage();
+      } else if (typeof msg.id === "string" && msg.id.startsWith("retry-launch:")) {
+        await userRetryLaunch(Number(msg.id.split(":")[1]), tabId);
       }
       return;
     }
@@ -1283,10 +1395,30 @@ async function getStatus() {
 // =====================================================================
 // Instalacion / actualizacion
 // =====================================================================
+// Al instalar o actualizar, Chrome no inyecta los content scripts en las
+// pestanas ya abiertas: sin esto, el visor abierto no podria informar nada
+// (y no se podria verificar si recibio un estudio).
+async function injectIntoOpenTabs() {
+  const tabs = await chrome.tabs.query({ url: `https://${HOST}/*` });
+  for (const t of tabs) {
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: t.id }, world: "MAIN", files: ["page-guard.js"] });
+      await chrome.scripting.executeScript({ target: { tabId: t.id, allFrames: true }, files: ["content.js"] });
+    } catch (e) {
+      log("info", `No pude preparar la pestaña ${t.id} ya abierta.`, String(e));
+    }
+  }
+  return tabs.length;
+}
+
 chrome.runtime.onInstalled.addListener((details) => {
   track(
     (async () => {
       await ready;
+      if (details.reason === "install" || details.reason === "update") {
+        const n = await injectIntoOpenTabs();
+        if (n) log("info", `Preparadas ${n} pestaña(s) de Synapse ya abiertas.`);
+      }
       // Adoptar visores ya abiertos (p.ej. tras actualizar la extension).
       for (const t of await findViewerTabs()) {
         if (!state.managed[t.id]) upsertManaged(t.id, { role: "viewer", windowId: t.windowId, path: shortUrl(t.url), navKey: urlKey(t.url), navAt: Date.now() });

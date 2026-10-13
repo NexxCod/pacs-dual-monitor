@@ -149,6 +149,29 @@ test("notebook + tres externos: elige un par contiguo de externos iguales", () =
   assert.equal(G.adjacency(pick.displays[0], pick.displays[1]), "horizontal");
 });
 
+test("externos con el notebook al medio: no abarca el notebook; usa un solo externo y avisa", () => {
+  const e1 = disp(1, -1920, 0, 1920, 1080);
+  const nb = disp(2, 0, 200, 1280, 720, { isPrimary: true, isInternal: true, scale: 1.5 });
+  const e2 = disp(3, 1280, 0, 1920, 1080);
+  const pick = G.pickViewerDisplays([e1, nb, e2]);
+  assert.equal(pick.displays.length, 1);
+  assert.notEqual(pick.displays[0].id, "2");
+  assert.equal(pick.reason, "single-external");
+  assert.ok(pick.warnings.some((w) => /no hay dos monitores externos contiguos/i.test(w)));
+  // Sin dato de pantalla interna: igual no abarca el notebook.
+  const nb2 = disp(2, 0, 200, 1280, 720, { isPrimary: true });
+  const pick2 = G.pickViewerDisplays([e1, nb2, e2]);
+  assert.equal(pick2.displays.length, 1);
+  assert.notEqual(pick2.displays[0].id, "2");
+});
+
+test("sin dato de pantalla interna y principal externa: abarca los dos externos iguales", () => {
+  const e1 = disp(1, 0, 0, 1920, 1080, { isPrimary: true });
+  const e2 = disp(2, 1920, 0, 1920, 1080);
+  const nb = disp(3, 3840, 300, 1366, 768);
+  assert.deepEqual(ids(G.pickViewerDisplays([e1, e2, nb])), ["1", "2"]);
+});
+
 test("boundsDelta y centerInside", () => {
   const t = { left: 1273, top: 0, width: 3854, height: 1087 };
   assert.equal(G.boundsDelta({ left: 1273, top: 0, width: 3854, height: 1087 }, t), 0);

@@ -10,7 +10,8 @@
     "system.display",
     "tabs",
     "webNavigation",
-    "storage"
+    "storage",
+    "scripting"
   ],
   "host_permissions": [
     "https://sjdpacs.synapsetimed.cl/*"

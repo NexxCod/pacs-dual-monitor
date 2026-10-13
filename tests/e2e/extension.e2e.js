@@ -127,7 +127,11 @@ async function waitViewer(study, opts) {
   return waitFor(
     async () => {
       for (const p of viewerPages()) {
-        const s = await p.evaluate(() => window.__viewer && { study: window.__viewer.study, loaded: window.__viewer.loaded }).catch(() => null);
+        // Con tiempo limite: un visor bloqueado por un alert() no contesta.
+        const s = await Promise.race([
+          p.evaluate(() => window.__viewer && { study: window.__viewer.study, loaded: window.__viewer.loaded }).catch(() => null),
+          sleep(800).then(() => null),
+        ]);
         if (s && s.loaded && (!study || s.study === study)) return p;
       }
       return null;
@@ -196,7 +200,7 @@ function it(name, fn) {
   });
 }
 
-describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 300000 }, () => {
+describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 600000 }, () => {
   before(async () => {
     server = await mock.start(0);
     const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "pacs-e2e-"));
@@ -538,6 +542,96 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 3000
     });
   });
 
+  it("P) aviso que queda visible en la worklist: el visor se trae al frente UNA sola vez", async () => {
+    await worklist.evaluate(() => window.openStudy("P1", "popup"));
+    await waitViewer("P1");
+    await worklist.evaluate(() => {
+      const d = document.createElement("div");
+      d.id = "warn";
+      d.textContent = "La aplicación se encuentra abierta en otra ventana.";
+      document.body.appendChild(d);
+    });
+    await sleep(6000);
+    const n = ((await logText()).match(/aviso en otra página; visor existente al frente/g) || []).length;
+    await worklist.evaluate(() => document.getElementById("warn").remove());
+    assert.equal(n, 1, "no debe robar el foco repetidamente");
+  });
+
+  it("Q) visor colgado que no contesta: no se cierra a ciegas, se pregunta; visor en uso: nunca se cierra", async () => {
+    // Visor en su propio proceso (pestaña aparte), que se cuelga.
+    const hung = await ctx.newPage();
+    await hung.goto(`${ORIGIN}/ImageViewer/layout?study=Q0&zombie=1`);
+    await sleep(1200);
+    await worklist.evaluate(() => localStorage.setItem("synapseViewerLock", JSON.stringify({ ts: Date.now() + 120000 })));
+    hung.evaluate(() => {
+      const end = Date.now() + 60000;
+      while (Date.now() < end) {}
+    }).catch(() => {});
+    await sleep(300);
+    const alive = await Promise.race([worklist.evaluate(() => true), sleep(2000).then(() => false)]);
+    assert.ok(alive, "la worklist sigue respondiendo (el visor colgado está en otro proceso)");
+    await worklist.evaluate(() => window.openStudy("Q1", "popup"));
+    await waitFor(async () => /se pregunta al usuario/.test(await logText()), { timeout: 25000, what: "pregunta al usuario" });
+    assert.ok((await tabsInfo()).some((t) => t.url.includes("study=Q0")), "el visor que no contestó NO se cerró solo");
+    // El usuario pulsa "Cerrar visor y reintentar".
+    await worklist.evaluate(() => localStorage.removeItem("synapseViewerLock"));
+    const st = await swEval(() => getStatus());
+    const L = st.launches.find((x) => x.phase === "awaiting-user");
+    assert.ok(L, "intento esperando al usuario");
+    const wl = (await tabsInfo()).find((t) => t.url.includes("/Synapse/Web"));
+    await swEval(([a, b]) => userRetryLaunch(a, b), [L.tabId, wl.tabId]);
+    const page = await waitViewer("Q1", { timeout: 15000 });
+    assert.ok(near((await viewerWindow(page)).bounds, TARGET));
+    assert.ok(!(await tabsInfo()).some((t) => t.url.includes("study=Q0")), "el visor colgado se cerró al confirmar");
+
+    // En uso: un visor que no recibe el estudio pero que estás usando no se cierra.
+    for (const p of viewerPages()) await p.close();
+    await worklist.evaluate(() => localStorage.removeItem("synapseViewerLock"));
+    await worklist.evaluate(() => window.openStudy("Q2", "popup", "zombie=1"));
+    const used = await waitViewer("Q2");
+    await sleep(300);
+    await worklist.evaluate(() => window.openStudy("Q3", "popup"));
+    await sleep(1500);
+    await used.mouse.click(400, 400);
+    await waitFor(async () => /visor existente en uso/.test(await logText()), { timeout: 12000, what: "visor en uso" });
+    await sleep(500);
+    assert.ok(!used.isClosed(), "el visor en uso sigue abierto");
+    assert.ok(!(await tabsInfo()).some((t) => t.url.includes("/WebQuery/Index")), "la lanzadera se cerró");
+  });
+
+  it("R) sin monitores externos al abrir y luego se conectan: el visor pasa a los externos y la worklist no se toca", async () => {
+    await patchDisplays([DISPLAYS[0]]);
+    await swEval(() => {
+      displayCache = null;
+      lastGoodDisplayCount = 0;
+    });
+    const wlBefore = (await tabsInfo()).find((t) => t.url.includes("/Synapse/Web"));
+    await worklist.evaluate(() => window.openStudy("R1", "tab"));
+    const page = await waitViewer("R1");
+    let v = await viewerWindow(page);
+    assert.equal(v.windowId, wlBefore.windowId, "sin externos, queda como pestaña de la worklist");
+    await patchDisplays(DISPLAYS);
+    await swEval(async () => {
+      displayCache = null;
+      await onDisplaysSettled();
+    });
+    v = await viewerWindow(page);
+    assert.equal(v.type, "popup");
+    assert.ok(near(v.bounds, TARGET), JSON.stringify(v.bounds));
+    const wlAfter = (await tabsInfo()).find((t) => t.url.includes("/Synapse/Web"));
+    assert.deepEqual(wlAfter.bounds, wlBefore.bounds, "la ventana de la worklist no se movió");
+  });
+
+  it("S) dos visores que abren a la vez: queda exactamente uno (el más reciente)", async () => {
+    await worklist.evaluate(() => {
+      window.open("/ImageViewer/layout?study=S1", "vS1", "width=800,height=600");
+      window.open("/ImageViewer/layout?study=S2", "vS2", "width=800,height=600");
+    });
+    await sleep(5000);
+    const left = viewerPages();
+    assert.equal(left.length, 1, `quedan ${left.length} visores`);
+  });
+
   it("L) error HTTP 500 al abrir el visor: recarga automática; la página de Opciones muestra el estado", async () => {
     await worklist.evaluate(() => window.open("/ImageViewer/layout?study=L1&status=500", "v500", "width=800,height=600"));
     await waitFor(async () => /Recargando el visor automáticamente: El servidor respondió con error \(HTTP 500\)/.test(await logText()), {
@@ -552,4 +646,25 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 3000
     assert.ok((await opt.locator("#log li").count()) > 0);
     await opt.close();
   });
+
+  it("T) reinyección al instalar/actualizar con Synapse abierto: no duplica y reemplaza instancias desconectadas", async () => {
+    await worklist.evaluate(() => window.openStudy("T1", "popup"));
+    const page = await waitViewer("T1");
+    const tab = await viewerWindow(page);
+    // 1) Con la instancia viva, reinyectar no la duplica.
+    assert.ok((await swEval(() => injectIntoOpenTabs())) >= 2);
+    await swEval((id) => noticeTab(id, "info", "prueba", { key: "t" }), tab.tabId);
+    await sleep(300);
+    assert.equal(await page.evaluate(() => document.querySelectorAll("pacs-dm-notices").length), 1);
+    // 2) Instancia desconectada (como la que deja una actualización): se reemplaza.
+    await swEval(
+      (id) => chrome.scripting.executeScript({ target: { tabId: id }, func: () => { window.__pacsDmAlive = () => false; } }),
+      tab.tabId
+    );
+    await swEval(() => injectIntoOpenTabs());
+    const act = await swEval((id) => getActivity(id), tab.tabId);
+    assert.ok(act && act.docStartedAt, "el visor abierto responde tras la reinyección");
+    assert.match(await logText(), /^(?![\s\S]*No pude preparar)/, "sin errores de inyección");
+  });
+
 });

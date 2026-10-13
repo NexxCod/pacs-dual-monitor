@@ -26,7 +26,7 @@ Ahora:
 - **El visor informa su escala**: si cambió *después* de abrir el estudio, se recarga solo (si aún no lo usaste) o te avisa con un botón **Recargar visor**, para no medir sobre un visor mal calibrado.
 - **Detecta imagen deformada** (contenido estirado) y le pide a Synapse recalcular; si persiste, te avisa.
 - **Avisa si la escala de Windows no es 100%** en los monitores del visor (aviso rojo y "!" en el ícono).
-- **Mejor elección de monitores**: los dos externos iguales y contiguos, aunque el principal de Windows sea un externo o tengas el notebook cerrado. La ventana ya no queda debajo de la barra de tareas.
+- **Mejor elección de monitores**: los dos externos iguales y contiguos, aunque el principal de Windows sea un externo o tengas el notebook cerrado. La ventana ya no queda debajo de la barra de tareas. Si en Windows el notebook quedó *entre* los dos externos, usa uno solo y te avisa para que reordenes las pantallas (antes la ventana pasaba por encima del notebook).
 - Si un monitor se apaga y vuelve (Windows mueve las ventanas al principal), el visor regresa a los externos.
 
 ### 2. Que el estudio abra (sin pantalla negra)
@@ -34,11 +34,12 @@ Ahora:
 Cada click en un estudio se sigue hasta confirmar que un visor lo cargó:
 
 - Si Synapse muestra **"La aplicación se encuentra abierta en otra ventana"** y hay un visor abierto: se **trae al frente** ese visor, se verifica que reciba el estudio y se cierra la lanzadera negra.
-- Si ese visor **no recibe el estudio** en 8 segundos (visor "zombie"): se cierra y se reintenta.
+- Si ese visor responde pero **no recibe el estudio** en 8 segundos (visor "zombie"): se cierra y se reintenta.
+- Un visor que **estás usando**, o que no contesta (no se puede verificar), **nunca se cierra solo**: te pregunta con un botón **Cerrar visor y reintentar**.
 - Si **no hay ningún visor** (el "candado" de Synapse quedó pegado): se reintenta hasta 2 veces con espera creciente.
 - Si todo falla, te avisa en pantalla (y en la worklist) para que vuelvas a hacer click, y el ícono muestra "!".
 - **Visor en negro** por pérdida del contexto gráfico, error de red o error del servidor (HTTP 5xx): se recarga solo, si aún no lo estabas usando; si ya lo usaste, te avisa con un botón.
-- Corrige un error de la versión anterior que **cerraba el visor recién abierto** cuando Synapse lo abría como pestaña.
+- Corrige un error de la versión anterior que **cerraba el visor recién abierto** cuando Synapse lo abría como pestaña. Al cerrar visores anteriores se conserva siempre el más reciente, y no se cierra uno que estés usando en ese momento.
 - El ahorro de memoria de Chrome ya no "descarta" la pestaña del visor.
 
 ---
@@ -49,7 +50,7 @@ Cada click en un estudio se sigue hasta confirmar que un visor lo cargó:
 2. Ve a `chrome://extensions` (en Edge: `edge://extensions`).
 3. Activa **Modo de desarrollador** (arriba a la derecha).
 4. **Cargar descomprimida** → selecciona la carpeta (la que tiene `manifest.json`).
-5. Si ya tenías una versión anterior: reemplaza los archivos y haz click en **recargar** (↻) en la tarjeta de la extensión. Cierra y vuelve a abrir las ventanas de Synapse.
+5. Si ya tenías una versión anterior: reemplaza los archivos y haz click en **recargar** (↻) en la tarjeta de la extensión. La extensión se prepara sola en las ventanas de Synapse que ya estén abiertas; si algo se ve raro, ciérralas y vuelve a abrirlas.
 
 Requiere Chrome o Edge 111 o superior.
 

@@ -18,6 +18,9 @@
   const isViewer = /\/ImageViewer\/layout/i.test(where);
   const isLauncher = /\/WebQuery\/Index/i.test(where) && /winpass=true/i.test(where);
   if (!isViewer && !isLauncher) return;
+  // Ya instalado (p.ej. reinyeccion tras actualizar la extension).
+  if (window.__pacsDmGuard) return;
+  window.__pacsDmGuard = true;
 
   let allowResize = false; // lo actualiza content.js segun Opciones
   let sent = 0;
