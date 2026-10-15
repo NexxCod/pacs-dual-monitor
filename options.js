@@ -127,9 +127,14 @@
         h("div", {}, "Destino: ", m.target ? rect(m.target.bounds) : "—"),
         delta == null ? null : h("div", { class: delta <= 3 ? "ok" : "warn" }, delta <= 3 ? "✓ En su lugar" : `Desfase de ${delta}px`),
         h("div", { class: dprOk ? "" : "error" }, "Escala del visor (devicePixelRatio): ", rep.dpr == null ? "sin informe aún" : pct(rep.dpr)),
-        viewportLine(m.viewport),
+        viewportLine(m.viewport, m),
         h("div", { class: zoomOk ? "" : "error" }, "Zoom: ", m.zoom == null ? "—" : pct(m.zoom)),
         rep.blockedCalls ? h("div", { class: "muted" }, `Intentos de Synapse de mover la ventana bloqueados: ${rep.blockedCalls}`) : null,
+        m.restores ? h("div", { class: "muted" }, `Ventana devuelta a su lugar automáticamente: ${m.restores} ${m.restores === 1 ? "vez" : "veces"}`) : null,
+        m.scrollFixes ? h("div", { class: "muted" }, `Página del visor devuelta a su lugar (desplazada): ${m.scrollFixes} ${m.scrollFixes === 1 ? "vez" : "veces"}`) : null,
+        m.keeperPausedUntil > Date.now()
+          ? h("div", { class: "warn" }, "Otro programa sigue moviendo la ventana: corrección automática en pausa por un minuto.")
+          : null,
         m.autoReloads ? h("div", { class: "warn" }, `Recargas automáticas en este estudio: ${m.autoReloads}`) : null
       );
     });
@@ -137,16 +142,19 @@
   }
 
   // Area de la pagina del visor medida en la pantalla (con el mouse).
-  function viewportLine(v) {
+  function viewportLine(v, m) {
     if (!v || !v.over) return h("div", { class: "muted" }, "Área del visor en pantalla: se mide al mover el mouse sobre el visor");
     const o = v.over;
     const out = [];
     if (o.bottom > 0) out.push(`${o.bottom} px abajo`);
     if (o.left > 0) out.push(`${o.left} px a la izquierda`);
     if (o.right > 0) out.push(`${o.right} px a la derecha`);
-    return out.length
-      ? h("div", { class: "warn" }, "Área del visor: se pasaba de la pantalla (" + out.join(", ") + ")")
-      : h("div", { class: "ok" }, "✓ Área del visor dentro de la pantalla");
+    if (!out.length) return h("div", { class: "ok" }, "✓ Área del visor dentro de la pantalla");
+    // La medicion es anterior al ajuste de bordes: ya quedo corregido.
+    if ((m.insetsFixedAt || 0) >= (v.at || 0)) {
+      return h("div", { class: "ok" }, "✓ Área del visor corregida (se pasaba " + out.join(", ") + ")");
+    }
+    return h("div", { class: "warn" }, "Área del visor: se pasaba de la pantalla (" + out.join(", ") + ")");
   }
 
   function renderLaunches(st) {

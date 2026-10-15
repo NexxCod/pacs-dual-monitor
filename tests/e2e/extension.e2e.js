@@ -191,7 +191,13 @@ async function resetWorld() {
   }, wlTab);
   await sleep(300);
   await worklist.evaluate(() => localStorage.removeItem("synapseViewerLock"));
+  await patchDisplays();
   await swEval(async () => {
+    clearTimeout(displayTimer);
+    displaysPending = false;
+    displayCache = null;
+    for (const t of guardTimers.values()) clearTimeout(t);
+    guardTimers.clear();
     state.managed = {};
     state.launches = {};
     state.warned = {};
@@ -205,11 +211,13 @@ async function resetWorld() {
   await swEval(async (tabId) => chrome.tabs.setZoom(tabId, 1), wlTab.tabId);
 }
 
-// Si una prueba falla, adjunta el registro de la extension al error.
+// Si una prueba falla, adjunta el registro de la extension al error
+// (PACS_DUMP_LOG=1 lo muestra siempre).
 function it(name, fn) {
   return nodeIt(name, async (t) => {
     try {
       await fn(t);
+      if (process.env.PACS_DUMP_LOG) console.log(`--- registro (${name.slice(0, 2)}) ---\n` + (await logText()));
     } catch (e) {
       const log = await logText().catch(() => "(sin registro)");
       e.message += "\n--- registro de la extensión ---\n" + log;
@@ -355,20 +363,33 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 6000
     assert.equal(badge, "!");
   });
 
-  it("G) guardia: si otro programa mueve la ventana durante la carga se restaura; pasada la guardia se respeta", async () => {
+  it("G) mantener en su lugar: si algo mueve la ventana vuelve sola, también pasada la guardia y por pocos px; desactivado se respeta", async () => {
     await setSettings({ guardSeconds: 3 });
     await worklist.evaluate(() => window.openStudy("G1", "popup"));
     const page = await waitViewer("G1");
     const win = await viewerWindow(page);
     await swEval((id) => chrome.windows.update(id, { left: 50, top: 50, width: 900, height: 700 }), win.windowId);
     await waitFor(async () => near((await viewerWindow(page)).bounds, TARGET), { timeout: 3000, what: "restauración" });
-    assert.match(await logText(), /Guardia: algo movió la ventana/);
+    assert.match(await logText(), /Algo movió o cambió el tamaño de la ventana del visor \(Δ\d+px\): vuelve a su lugar \(vez n\.º 1\)/);
+    // Pasada la guardia sigue en su lugar (antes había que apretar el botón).
     await sleep(3500);
     await swEval((id) => chrome.windows.update(id, { left: 60, top: 60, width: 900, height: 700 }), win.windowId);
+    await waitFor(async () => near((await viewerWindow(page)).bounds, TARGET), { timeout: 3000, what: "restauración tras la guardia" });
+    // Unos pocos px también se corrigen: ya cambian las mediciones.
+    await swEval((id) => chrome.windows.update(id, { top: 6, height: 1074 }), win.windowId);
+    await waitFor(async () => /vuelve a su lugar \(vez n\.º 3\)/.test(await logText()), { timeout: 3000, what: "corrección de 6 px" });
+    await waitFor(async () => near((await viewerWindow(page)).bounds, TARGET), { timeout: 3000, what: "restauración de 6 px" });
+    // La imagen se reacomoda tras devolverla (como con el botón).
+    await waitFor(async () => (await page.evaluate(() => window.__viewer.resizes.some((r) => !r.trusted))), {
+      timeout: 3000,
+      what: "reacomodo del layout",
+    });
+    // Sin «mantener siempre», pasada la guardia se respeta lo que hagas.
+    await setSettings({ guardSeconds: 3, keepInPlace: false });
+    await swEval((id) => chrome.windows.update(id, { left: 70, top: 70, width: 900, height: 700 }), win.windowId);
     await sleep(1200);
-    const after = await viewerWindow(page);
-    assert.ok(near(after.bounds, { left: 60, top: 60, width: 900, height: 700 }), "fuera de la guardia se respeta al usuario");
-    // Reubicacion manual (equivale a Ctrl+Shift+Y)
+    assert.ok(near((await viewerWindow(page)).bounds, { left: 70, top: 70, width: 900, height: 700 }), "sin «mantener siempre» se respeta");
+    // Reubicación manual (equivale a Ctrl+Shift+Y)
     const r = await swEval(() => repositionViewerNow("prueba"));
     assert.equal(r.ok, true);
     assert.ok(near((await viewerWindow(page)).bounds, TARGET));
@@ -392,33 +413,36 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 6000
     assert.equal(await page.evaluate(() => devicePixelRatio), 1);
   });
 
-  it("I) la escala cambia después de iniciar: sin uso → recarga automática; con uso → aviso con botón", async () => {
+  it("I) la escala cambia y queda cambiada tras iniciar: sin uso → recarga automática; con uso → aviso; un cambio pasajero no hace nada", async () => {
     await worklist.evaluate(() => window.openStudy("I1", "popup"));
     let page = await waitViewer("I1");
     await sleep(800);
     const t0 = await page.evaluate(() => window.__viewer.t0);
     const tab = await viewerWindow(page);
-    // Otro programa cambia el zoom (escala) del visor ya iniciado.
+    // Pasajero: el zoom vuelve solo al 100% (la escala final es la del inicio).
+    await swEval((id) => chrome.tabs.setZoom(id, 1.25), tab.tabId);
+    await waitFor(async () => (await swEval((id) => chrome.tabs.getZoom(id), tab.tabId)) === 1, { timeout: 3000, what: "zoom 100%" });
+    await waitFor(async () => /volvió a la del inicio \(sin riesgo\)/.test(await logText()), { timeout: 6000, what: "informe del cambio pasajero" });
+    assert.equal(await page.evaluate(() => window.__viewer.t0), t0, "un cambio pasajero no recarga");
+    assert.doesNotMatch(await logText(), /La escala del visor cambió/);
+    // Otro programa cambia la escala y queda así: sin uso → recarga automática.
     await setSettings({ forceZoom100: false });
     await swEval((id) => chrome.tabs.setZoom(id, 1.25), tab.tabId);
-    await sleep(300);
-    await swEval((id) => chrome.tabs.setZoom(id, 1), tab.tabId);
-    await setSettings();
     await waitFor(async () => (await page.evaluate(() => window.__viewer && window.__viewer.t0).catch(() => 0)) > t0, {
       timeout: 12000,
       what: "recarga automática",
     });
     assert.match(await logText(), /Recargando el visor automáticamente: La escala del visor cambió/);
     // Con uso: no recarga, avisa.
-    page = await waitViewer("I1");
+    await resetWorld();
+    await worklist.evaluate(() => window.openStudy("I2", "popup"));
+    page = await waitViewer("I2");
     await sleep(500);
     await page.mouse.click(500, 500);
     const t1 = await page.evaluate(() => window.__viewer.t0);
+    const tab2 = await viewerWindow(page);
     await setSettings({ forceZoom100: false });
-    await swEval((id) => chrome.tabs.setZoom(id, 1.25), tab.tabId);
-    await sleep(300);
-    await swEval((id) => chrome.tabs.setZoom(id, 1), tab.tabId);
-    await setSettings();
+    await swEval((id) => chrome.tabs.setZoom(id, 1.25), tab2.tabId);
     await waitFor(async () => /Visor con problema \(aviso al usuario\): La escala del visor cambió/.test(await logText()), {
       timeout: 8000,
       what: "aviso con uso",
@@ -459,18 +483,15 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 6000
       await onDisplaysSettled();
     });
     assert.ok(near((await viewerWindow(page)).bounds, TARGET));
-    // Un monitor se apaga y vuelve: Windows dejo la ventana en el principal.
-    await setSettings({ guardSeconds: 0 });
-    await sleep(300);
+    // Un monitor se apaga y vuelve: mientras cambian los monitores Windows
+    // deja la ventana en el principal (el mantenedor no pelea con Windows) y
+    // al estabilizarse vuelve a los externos.
     const w = await viewerWindow(page);
+    await swEval(() => scheduleDisplaysSettled());
     await swEval((id) => chrome.windows.update(id, { left: 0, top: 0, width: 1000, height: 700 }), w.windowId);
     await sleep(500);
-    assert.ok(near((await viewerWindow(page)).bounds, { left: 0, top: 0, width: 1000, height: 700 }));
-    await swEval(async () => {
-      displayCache = null;
-      await onDisplaysSettled();
-    });
-    assert.ok(near((await viewerWindow(page)).bounds, TARGET), "vuelve a los externos");
+    assert.ok(near((await viewerWindow(page)).bounds, { left: 0, top: 0, width: 1000, height: 700 }), "no pelea con Windows");
+    await waitFor(async () => near((await viewerWindow(page)).bounds, TARGET), { timeout: 5000, what: "vuelve a los externos" });
   });
 
   it("M) aviso dentro del propio visor: se recarga y abre; si persiste, se detiene sin bucle", async () => {
@@ -536,16 +557,16 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 6000
       what: "uso registrado",
     });
     const t0 = await page.evaluate(() => window.__viewer.t0);
+    // Otro programa cambia la escala y queda así: con el visor en uso, solo avisa.
     await setSettings({ forceZoom100: false });
     await swEval((id) => chrome.tabs.setZoom(id, 1.25), tab.tabId);
-    await sleep(300);
-    await swEval((id) => chrome.tabs.setZoom(id, 1), tab.tabId);
-    await setSettings();
     await waitFor(async () => /Visor con problema \(aviso al usuario\): La escala del visor cambió/.test(await logText()), {
       timeout: 8000,
       what: "aviso (visor en uso)",
     });
     assert.equal(await page.evaluate(() => window.__viewer.t0), t0, "no recargó un visor en uso");
+    await swEval((id) => chrome.tabs.setZoom(id, 1), tab.tabId);
+    await setSettings();
 
     await page.close();
     await worklist.evaluate(() => window.openStudy("O2", "popup", "iframe=1&webgl=1"));
@@ -718,6 +739,7 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 6000
     await waitFor(async () => (await swEval((id) => state.managed[id].inputAt || 0, w3.tabId)) > 0, { what: "uso registrado" });
     const m = await page3.evaluate(() => ({ iw: innerWidth, ih: innerHeight, oh: outerHeight }));
     const rect = { left: tall.left, top: tall.top + (m.oh - m.ih), width: m.iw, height: m.ih };
+    await sleep(800); // no se mide mientras la extensión está moviendo la ventana
     await swEval(([tabId, windowId, r]) => onViewportMeasured(tabId, { rect: r, hasInput: true }, { tab: { windowId } }), [w3.tabId, w3.windowId, rect]);
     assert.match(await logText(), /Bordes ajustados: el visor se pasaba 7 px hacia abajo[\s\S]*Bordes ajustados: el visor se pasaba 7 px hacia abajo/);
     await sleep(300);
@@ -725,6 +747,121 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 6000
     const r = await swEval(() => repositionViewerNow("prueba"));
     assert.equal(r.ok, true);
     assert.ok(near((await viewerWindow(page3)).bounds, TARGET));
+  });
+
+  it("V) maximizar, pantalla completa o F11: la ventana vuelve a su lugar; la pantalla completa pedida por la página se bloquea", async () => {
+    await worklist.evaluate(() => window.openStudy("V1", "popup"));
+    const page = await waitViewer("V1");
+    const win = await viewerWindow(page);
+    // La página pide pantalla completa (la dejaría en un solo monitor).
+    const fsResult = await page.evaluate(() =>
+      document.documentElement.requestFullscreen().then(
+        () => "ok",
+        (e) => e.name + ": " + e.message
+      )
+    );
+    assert.match(fsResult, /TypeError: Pantalla completa bloqueada/);
+    assert.equal(await page.evaluate(() => !!document.fullscreenElement), false);
+    await waitFor(async () => /Synapse pidió pantalla completa — bloqueado/.test(await logText()), { timeout: 3000, what: "registro del bloqueo" });
+    // Pantalla completa del navegador (F11 o la de Chrome).
+    await swEval((id) => chrome.windows.update(id, { state: "fullscreen" }), win.windowId);
+    await waitFor(async () => /La ventana del visor pasó a pantalla completa: vuelve a su lugar/.test(await logText()), {
+      timeout: 3000,
+      what: "registro de pantalla completa",
+    });
+    const back = async (what) =>
+      waitFor(
+        async () => {
+          const w = await swEval((id) => chrome.windows.get(id), win.windowId);
+          return w.state === "normal" && near(w, TARGET);
+        },
+        { timeout: 4000, what }
+      );
+    await back("vuelve de pantalla completa");
+    // Maximizar (aquí, sin gestor de ventanas, X11 lo ignora; en Windows
+    // dispara el mismo mecanismo): en cualquier caso queda en su lugar.
+    await swEval((id) => chrome.windows.update(id, { state: "maximized" }), win.windowId);
+    await sleep(1000);
+    await back("vuelve de maximizada");
+    // Minimizar a propósito no se corrige; al restaurarla queda en su lugar.
+    await swEval((id) => chrome.windows.update(id, { state: "minimized" }), win.windowId);
+    await sleep(800);
+    await swEval((id) => chrome.windows.update(id, { state: "normal" }), win.windowId);
+    await waitFor(async () => near((await viewerWindow(page)).bounds, TARGET), { timeout: 3000, what: "restaurada" });
+  });
+
+  it("W) otro programa que pelea moviendo la ventana: tras unos intentos se pausa y avisa; el botón la reubica", async () => {
+    await worklist.evaluate(() => window.openStudy("W1", "popup"));
+    const page = await waitViewer("W1");
+    const win = await viewerWindow(page);
+    await swEval((id) => {
+      self.__fighter = setInterval(() => chrome.windows.update(id, { left: 100, top: 100, width: 800, height: 600 }).catch(() => {}), 250);
+    }, win.windowId);
+    try {
+      await waitFor(async () => /Otro programa sigue moviendo la ventana del visor: dejo de corregirla/.test(await logText()), {
+        timeout: 20000,
+        what: "pausa por pelea",
+      });
+    } finally {
+      await swEval(() => clearInterval(self.__fighter));
+    }
+    await sleep(800);
+    assert.ok(near((await viewerWindow(page)).bounds, { left: 100, top: 100, width: 800, height: 600 }), "en pausa no se corrige");
+    const rec = await swEval((id) => state.managed[id], win.tabId);
+    assert.ok(rec.keeperPausedUntil > Date.now(), "pausa registrada");
+    const r = await swEval(() => repositionViewerNow("prueba"));
+    assert.equal(r.ok, true);
+    assert.ok(near((await viewerWindow(page)).bounds, TARGET));
+    // Tras reubicar a mano, el mantenedor vuelve a funcionar.
+    await swEval((id) => chrome.windows.update(id, { left: 30, top: 30, width: 900, height: 700 }), win.windowId);
+    await waitFor(async () => near((await viewerWindow(page)).bounds, TARGET), { timeout: 3000, what: "mantenedor reactivado" });
+  });
+
+  it("X) la página del visor se desplaza (scroll): vuelve a su lugar y se reacomoda; si algo la sigue desplazando se pausa", async () => {
+    await worklist.evaluate(() => window.openStudy("X1", "popup", "tall=1"));
+    const page = await waitViewer("X1");
+    await sleep(500);
+    await page.evaluate(() => window.scrollTo(0, 150));
+    assert.equal(await page.evaluate(() => window.scrollY), 150);
+    await waitFor(async () => (await page.evaluate(() => window.scrollY)) === 0, { timeout: 3000, what: "scroll vuelve a 0" });
+    assert.ok(await page.evaluate(() => window.__viewer.resizes.some((r) => !r.trusted)), "se pidió reacomodar el layout");
+    await waitFor(async () => /La página del visor estaba desplazada \(0, 150 px\): vuelve a su lugar/.test(await logText()), {
+      timeout: 3000,
+      what: "registro del scroll",
+    });
+    // Algo que la desplaza sin parar: no se pelea indefinidamente.
+    await page.evaluate(() => {
+      window.__scroller = setInterval(() => window.scrollTo(0, 80), 100);
+    });
+    try {
+      await waitFor(async () => /La página del visor se sigue desplazando sola/.test(await logText()), { timeout: 8000, what: "pausa del scroll" });
+    } finally {
+      await page.evaluate(() => clearInterval(window.__scroller));
+    }
+  });
+
+  it("Y) monitores que cambian sin aviso: el visor no se fuerza a un lugar viejo; sin externos se suelta y al volver se reubica", async () => {
+    await worklist.evaluate(() => window.openStudy("Y1", "popup"));
+    const page = await waitViewer("Y1");
+    const win = await viewerWindow(page);
+    // Mismos monitores con otros ids (p.ej. tras reconectar el dock).
+    const renamed = [DISPLAYS[0], display(20, "Externo A", 1920), display(30, "Externo B", 3840)];
+    await patchDisplays(renamed);
+    await swEval((id) => chrome.windows.update(id, { left: 40, top: 40, width: 900, height: 700 }), win.windowId);
+    await waitFor(async () => near((await viewerWindow(page)).bounds, TARGET), { timeout: 6000, what: "reubicado con los monitores nuevos" });
+    assert.match(await logText(), /Los monitores del visor cambiaron: se recalcula su lugar/);
+    assert.deepEqual(await swEval((id) => state.managed[id].target.displayIds, win.tabId), ["20", "30"]);
+    // Se desconectan los externos: se deja de mantener el visor en un lugar que ya no existe.
+    await patchDisplays([DISPLAYS[0]]);
+    await swEval(() => scheduleDisplaysSettled());
+    await waitFor(async () => (await swEval((id) => state.managed[id].target, win.tabId)) === null, { timeout: 6000, what: "destino suelto" });
+    await swEval((id) => chrome.windows.update(id, { left: 0, top: 0, width: 1000, height: 700 }), win.windowId);
+    await sleep(800);
+    assert.ok(near((await viewerWindow(page)).bounds, { left: 0, top: 0, width: 1000, height: 700 }), "sin externos no se fuerza");
+    // Vuelven: se reubica solo.
+    await patchDisplays(DISPLAYS);
+    await swEval(() => scheduleDisplaysSettled());
+    await waitFor(async () => near((await viewerWindow(page)).bounds, TARGET), { timeout: 6000, what: "reubicado al volver los externos" });
   });
 
   it("T) reinyección al instalar/actualizar con Synapse abierto: no duplica y reemplaza instancias desconectadas", async () => {

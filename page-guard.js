@@ -1,6 +1,8 @@
 // page-guard.js
 // Corre en el "MAIN world" (el mismo contexto JS que Synapse), antes que
 // cualquier script de la pagina, y solo en la lanzadera y el visor.
+// Tambien bloquea la pantalla completa pedida por el visor (la dejaria en un
+// solo monitor).
 //
 // Synapse "restaura" el tamano y posicion guardados del visor al abrir cada
 // estudio usando window.moveTo/resizeTo. Chrome recorta esas llamadas a UN
@@ -57,6 +59,38 @@
     try {
       Object.defineProperty(window, name, { value: wrapped, writable: true, configurable: true });
     } catch (e) { /* nada */ }
+  }
+
+  // Pantalla completa pedida por la pagina: dejaria el visor en UN solo
+  // monitor. Se bloquea en el visor (salvo que se desactive en Opciones).
+  if (isViewer) {
+    const blockFs = (proto, name) => {
+      const original = proto && proto[name];
+      if (typeof original !== "function") return;
+      const wrapped = function () {
+        emit("fullscreen", { name, blocked: !allowResize });
+        if (allowResize) return original.apply(this, arguments);
+        // Igual que cuando Chrome la niega: evento de error y, en la API
+        // estandar, una promesa rechazada (ya manejada: sin errores sueltos).
+        const el = this;
+        setTimeout(() => {
+          try {
+            const type = name === "requestFullscreen" ? "fullscreenerror" : "webkitfullscreenerror";
+            el.dispatchEvent(new Event(type, { bubbles: true, composed: true }));
+          } catch (e) { /* nada */ }
+        }, 0);
+        if (name !== "requestFullscreen") return undefined;
+        const p = Promise.reject(new TypeError("Pantalla completa bloqueada por PACS Dual Monitor"));
+        p.catch(() => {});
+        return p;
+      };
+      try {
+        Object.defineProperty(proto, name, { value: wrapped, writable: true, configurable: true });
+      } catch (e) { /* nada */ }
+    };
+    for (const name of ["requestFullscreen", "webkitRequestFullscreen", "webkitRequestFullScreen"]) {
+      blockFs(Element.prototype, name);
+    }
   }
 
   for (const name of ["alert", "confirm"]) {

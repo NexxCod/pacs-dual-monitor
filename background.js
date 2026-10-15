@@ -10,7 +10,10 @@
 //      el visor (desde la lanzadera o al empezar la navegacion), no despues;
 //    - se bloquea el "restaurar posicion" de Synapse (page-guard.js), que
 //      Chrome recorta a un solo monitor y achicaba la ventana a mitad de carga;
-//    - una guardia corta (onBoundsChanged) corrige cualquier otro cambio;
+//    - el visor se mantiene SIEMPRE en su lugar (onBoundsChanged): si algo lo
+//      mueve, achica, maximiza o pone en pantalla completa, vuelve solo y se
+//      le pide a Synapse reacomodar la imagen (sin pelear sin fin con otro
+//      programa ni con Windows mientras cambian los monitores);
 //    - zoom de Synapse fijo en 100%;
 //    - el visor informa su escala/tamano; si cambiaron despues de inicializar,
 //      se recarga solo (si aun no lo usaste) o te avisa con un boton.
@@ -43,16 +46,21 @@ const DEFAULT_SETTINGS = Object.freeze({
   showNotices: true, // avisos en pantalla
   singleMonitorFallback: false, // si hay un solo externo, usarlo solo
   invisibleBorder: 7, // borde invisible de Windows (px)
-  guardSeconds: 12, // segundos de guardia tras cargar el visor
+  keepInPlace: true, // mantener SIEMPRE el visor en su lugar
+  guardSeconds: 12, // si no se mantiene siempre: segundos de guardia tras cargar
   displayIds: [], // monitores elegidos a mano ([] = automatico)
 });
 
 // Tiempos y umbrales.
 const T = {
-  exactPx: 3, // diferencia aceptada como "exacto"
-  guardDriftPx: 12, // la guardia solo actua sobre cambios mayores
+  exactPx: 3, // diferencia aceptada como "exacto" (mas que esto ya afecta las mediciones)
   guardBeforeLoadMs: 45000, // guardia mientras el visor carga
-  guardMaxReapplies: 6,
+  keeperDelayMs: 200, // espera antes de devolver la ventana a su lugar
+  keeperVerifyMs: 700, // verificacion tras cada reubicacion propia
+  fightWindowMs: 1500, // si la vuelven a mover antes de esto, es una "pelea"
+  fightMaxRounds: 5,
+  fightPauseMs: 60000,
+  restMaxPx: 30, // hasta aqui una diferencia se atribuye a un limite de Windows
   applyRetries: 2,
   settlePollMs: 40,
   settleMaxMs: 450,
@@ -373,12 +381,32 @@ async function computeTarget() {
   };
 }
 
+// Mientras los monitores cambian (y hasta reubicar el visor), el mantenedor
+// no actua: Windows esta moviendo las ventanas.
 let displayTimer = null;
-chrome.system.display.onDisplayChanged.addListener(() => {
+let displayGen = 0;
+let displaysPending = false;
+
+function displaysChanging() {
+  return displaysPending;
+}
+
+function scheduleDisplaysSettled() {
   displayCache = null;
+  displayGen++;
+  displaysPending = true;
   clearTimeout(displayTimer);
-  displayTimer = setTimeout(() => track(onDisplaysSettled()), 1500);
-});
+  displayTimer = setTimeout(() => {
+    const gen = displayGen;
+    track(
+      onDisplaysSettled().finally(() => {
+        if (gen === displayGen) displaysPending = false;
+      })
+    );
+  }, 1500);
+}
+
+chrome.system.display.onDisplayChanged.addListener(scheduleDisplaysSettled);
 
 async function onDisplaysSettled() {
   await ready;
@@ -386,7 +414,12 @@ async function onDisplaysSettled() {
   log("info", `Cambió la configuración de monitores (${displays.length}).`);
   if (!settings.placeViewer) return;
   const target = await computeTarget();
-  if (!target) return;
+  if (!target) {
+    // Sin monitores para el visor: no se lo mantiene en un lugar que ya no
+    // existe. Cuando vuelvan, se reubica.
+    for (const rec of Object.values(state.managed)) if (rec.target) upsertManaged(rec.tabId, { target: null, restBounds: null });
+    return;
+  }
   for (const rec of Object.values(state.managed)) {
     const tab = await getTab(rec.tabId);
     // Solo visores/lanzaderas: nunca la worklist ni otras paginas.
@@ -396,11 +429,11 @@ async function onDisplaysSettled() {
     // Al apagarse/encenderse un monitor Windows mueve las ventanas al
     // principal: se compara con donde ESTA la ventana, no con el destino viejo.
     if (win.type === "popup" && G.boundsDelta(win, target.bounds) <= T.exactPx) {
-      upsertManaged(rec.tabId, { target: targetInfo(target) });
+      upsertManaged(rec.tabId, { target: targetInfo(target), restBounds: null });
       continue;
     }
     log("info", "Reubicando el visor por cambio de monitores.", { ahora: box(win), destino: target.bounds });
-    await placeTab(tab, target, "cambio de monitores", { guardUntil: Date.now() + 5000, reapplies: 0, userMovedAt: 0 });
+    await placeTab(tab, target, "cambio de monitores", { guardUntil: Date.now() + 5000, fightRounds: 0, keeperPausedUntil: 0, userMovedAt: 0 });
   }
 }
 
@@ -428,7 +461,7 @@ async function placeTab(tab, target, why, extra) {
   } else if (win.type !== "popup") {
     return { ok: false };
   }
-  upsertManaged(tab.id, Object.assign({ windowId, target: targetInfo(target) }, extra || {}));
+  upsertManaged(tab.id, Object.assign({ windowId, target: targetInfo(target), restBounds: null }, extra || {}));
   return applyBounds(windowId, target.bounds, why);
 }
 
@@ -478,7 +511,7 @@ async function applyBounds(windowId, b, why) {
   return withWindowLock(windowId, async () => {
     let w = await chrome.windows.get(windowId);
     if (w.state === "normal" && G.boundsDelta(w, b) <= T.exactPx) return { ok: true, changed: false, win: w };
-    // Solo desde aqui los cambios de la ventana son nuestros (la guardia los ignora).
+    // Solo desde aqui los cambios de la ventana son nuestros (el mantenedor los ignora).
     markOwn(windowId, 3000);
     try {
       const before = box(w);
@@ -504,9 +537,20 @@ async function applyBounds(windowId, b, why) {
         ok ? `Ventana ${windowId} ubicada (${why}).` : `La ventana ${windowId} quedó a ${delta}px del destino (${why}).`,
         { antes: before, destino: b, final: box(w) }
       );
+      // Si Windows no la deja llegar exacta (le faltan pocos px), su lugar es
+      // donde quedo: el mantenedor no insiste en bucle (vuelve a intentarlo si
+      // algo la mueve). Lejos del destino no es un limite de Windows, es que
+      // otro programa la movio: eso no se acepta como su lugar.
+      const rec = managedByWindow(windowId);
+      if (rec && rec.target && G.boundsDelta(rec.target.bounds, b) === 0) {
+        upsertManaged(rec.tabId, { restBounds: !ok && w.state === "normal" && delta <= T.restMaxPx ? box(w) : null });
+      }
       return { ok, changed: true, win: w, delta };
     } finally {
       ownUntil.set(windowId, Date.now() + 500);
+      // Si algo la movio mientras la acomodabamos (esos cambios se ignoran por
+      // ser "nuestros"), se detecta al terminar.
+      setTimeout(() => track(verifyInPlace(windowId)), T.keeperVerifyMs);
     }
   });
 }
@@ -540,11 +584,13 @@ async function doPrepare(tabId, url, role, why) {
     navKey: key,
     navAt: now,
     guardUntil: now + T.guardBeforeLoadMs,
-    reapplies: 0,
+    fightRounds: 0,
+    keeperPausedUntil: 0,
     userMovedAt: 0,
     loadedAt: null,
     report: null,
-    relayouts: 0,
+    lastRelayoutAt: 0,
+    distortedTries: 0,
   };
   // Las recargas automaticas se cuentan por estudio.
   if (!old || old.navKey !== key) Object.assign(patch, { autoReloads: 0, lastAutoReloadAt: 0 });
@@ -576,7 +622,7 @@ async function doPrepare(tabId, url, role, why) {
     log("info", `Ventana ${windowId} de tipo "${win.type}": no se toca.`);
     return rec;
   }
-  rec = upsertManaged(tabId, { windowId, target: targetInfo(target) });
+  rec = upsertManaged(tabId, { windowId, target: targetInfo(target), restBounds: null });
   await applyBounds(windowId, target.bounds, why);
   target.warnings.forEach((text, i) => warnOnce(`display:${text}`, tabId, "warn", text, { key: `display-${i}` }));
   return rec;
@@ -735,46 +781,114 @@ chrome.windows.onRemoved.addListener((windowId) => {
 });
 
 // =====================================================================
-// Guardia: si algo mas mueve la ventana mientras el visor carga, se restaura
+// Mantener el visor en su lugar: si algo lo mueve, lo achica, lo maximiza o
+// lo pone en pantalla completa (Synapse, su agente, otra extension, Windows),
+// vuelve solo a su lugar y Synapse reacomoda la imagen. Es lo mismo que hace
+// el boton de la extension, pero automatico y en todo momento.
 // =====================================================================
 const guardTimers = new Map();
 
 chrome.windows.onBoundsChanged.addListener((win) => track(onBoundsChanged(win)));
 
+// Fuera de su lugar: cualquier diferencia de mas de 3 px ya cambia las
+// mediciones. Si Windows no la dejo llegar exacta al destino, su lugar es
+// donde quedo (asi no se insiste en bucle).
+function displaced(win, rec) {
+  if (win.state !== "normal") return true;
+  if (G.boundsDelta(win, rec.target.bounds) <= T.exactPx) return false;
+  return !(rec.restBounds && G.boundsDelta(win, rec.restBounds) <= T.exactPx);
+}
+
 async function onBoundsChanged(win) {
   await ready;
   const rec = managedByWindow(win.id);
   if (!rec || !rec.target || !settings.placeViewer || win.type !== "popup" || isOwn(win.id)) return;
-  const delta = G.boundsDelta(win, rec.target.bounds);
-  if (delta <= T.guardDriftPx) return;
+  // Minimizada a proposito: al restaurarla vuelve sola a su lugar.
+  if (win.state === "minimized" || !displaced(win, rec)) return;
+  // Cambiando los monitores (Windows mueve las ventanas): se reubica al
+  // estabilizarse, sin pelear con Windows mientras tanto.
+  if (displaysChanging()) return;
   const now = Date.now();
-  if (now > (rec.guardUntil || 0)) {
+  if (!settings.keepInPlace && now > (rec.guardUntil || 0)) {
     if (!rec.userMovedAt || now - rec.userMovedAt > 10000) {
-      log("info", `Moviste o redimensionaste el visor (Δ${delta}px); se respeta. Ctrl+Shift+Y lo vuelve a ubicar.`, box(win));
+      log("info", "Moviste o redimensionaste el visor; se respeta (opción «mantener siempre» desactivada). Ctrl+Shift+Y lo reubica.", box(win));
     }
     upsertManaged(rec.tabId, { userMovedAt: now });
     return;
   }
-  if ((rec.reapplies || 0) >= T.guardMaxReapplies) {
-    warnOnce(
-      `fight:${rec.tabId}:${rec.navKey}`,
-      rec.tabId,
-      "warn",
-      "Otro programa sigue moviendo la ventana del visor (¿la extensión de Synapse de Fujifilm?). Desactívala o usa Ctrl+Shift+Y."
-    );
+  if (rec.keeperPausedUntil && now < rec.keeperPausedUntil) return;
+  // Ya hay una restauracion en camino (p.ej. la estan arrastrando, o un mismo
+  // cambio trae varios eventos): solo se posterga.
+  if (guardTimers.has(win.id)) {
+    clearTimeout(guardTimers.get(win.id));
+    guardTimers.set(win.id, setTimeout(() => track(restoreWindow(win.id)), T.keeperDelayMs));
     return;
   }
-  upsertManaged(rec.tabId, { reapplies: (rec.reapplies || 0) + 1 });
-  log("info", `Guardia: algo movió la ventana del visor (Δ${delta}px); restaurando.`, box(win));
+  // "Pelea": otro programa la vuelve a mover apenas la devolvemos.
+  const fighting = rec.lastRestoreAt && now - rec.lastRestoreAt < T.fightWindowMs;
+  const rounds = fighting ? (rec.fightRounds || 0) + 1 : 0;
+  if (rounds >= T.fightMaxRounds) {
+    upsertManaged(rec.tabId, { keeperPausedUntil: now + T.fightPauseMs, fightRounds: 0 });
+    log("warn", "Otro programa sigue moviendo la ventana del visor: dejo de corregirla por 1 minuto.", box(win));
+    warnOnce(
+      `fight:${rec.tabId}`,
+      rec.tabId,
+      "warn",
+      "Otro programa sigue moviendo la ventana del visor (¿la extensión de Fujifilm Synapse o el agente de Synapse?). Dejo de corregirla por un minuto; Ctrl+Shift+Y la reubica."
+    );
+    // Pasada la pausa, se vuelve a revisar aunque nada la mueva de nuevo.
+    const windowId = win.id;
+    setTimeout(() => track(verifyInPlace(windowId)), T.fightPauseMs + 500);
+    return;
+  }
+  upsertManaged(rec.tabId, { fightRounds: rounds });
+  const what =
+    win.state === "maximized"
+      ? "Se maximizó la ventana del visor"
+      : win.state === "fullscreen"
+        ? "La ventana del visor pasó a pantalla completa"
+        : `Algo movió o cambió el tamaño de la ventana del visor (Δ${G.boundsDelta(win, rec.target.bounds)}px)`;
+  // Sin inundar el registro si pasa a cada rato: las 10 primeras y luego 1 de cada 10.
+  const n = (rec.restores || 0) + 1;
+  if (n <= 10 || n % 10 === 0) log("info", `${what}: vuelve a su lugar (vez n.º ${n}).`, box(win));
   clearTimeout(guardTimers.get(win.id));
-  guardTimers.set(
-    win.id,
-    setTimeout(() => {
-      guardTimers.delete(win.id);
-      const r = managedByWindow(win.id);
-      if (r && r.target) track(applyBounds(win.id, r.target.bounds, "guardia"));
-    }, 120)
-  );
+  guardTimers.set(win.id, setTimeout(() => track(restoreWindow(win.id)), T.keeperDelayMs));
+}
+
+async function restoreWindow(windowId) {
+  guardTimers.delete(windowId);
+  const rec = managedByWindow(windowId);
+  if (!rec || !rec.target || displaysChanging()) return;
+  // Si los monitores ya no son los del destino guardado, no se insiste:
+  // se recalcula el destino como en un cambio de monitores.
+  if (!(await targetStillValid(rec.target))) {
+    log("info", "Los monitores del visor cambiaron: se recalcula su lugar.");
+    scheduleDisplaysSettled();
+    return;
+  }
+  const res = await applyBounds(windowId, rec.target.bounds, "mantener en su lugar").catch(() => null); // cerrada
+  if (!res || !res.changed) return;
+  const r = upsertManaged(rec.tabId, { lastRestoreAt: Date.now(), restores: (rec.restores || 0) + 1 });
+  // Que Synapse reacomode la imagen al tamano correcto (igual que el boton).
+  // (Si la vuelven a mover mientras tanto, applyBounds lo verifica al terminar.)
+  setTimeout(() => chrome.tabs.sendMessage(r.tabId, { type: "pacs-dm:relayout" }, { frameId: 0 }).catch(() => {}), 400);
+}
+
+async function verifyInPlace(windowId) {
+  const w = await chrome.windows.get(windowId).catch(() => null);
+  const cur = managedByWindow(windowId);
+  if (w && cur && cur.target && w.state !== "minimized" && !isOwn(windowId) && displaced(w, cur)) await onBoundsChanged(w);
+}
+
+// El destino guardado sigue correspondiendo a los monitores de ahora?
+async function targetStillValid(target) {
+  if (!target.area || !(target.displayIds || []).length) return true;
+  const displays = await getDisplays(true).catch(() => null);
+  if (!displays) return true;
+  const list = target.displayIds.map((id) => displays.find((d) => String(d.id) === String(id)));
+  if (list.some((d) => !d)) return false;
+  const a = G.visibleArea(list);
+  return ["left", "top", "right", "bottom"].every((k) => a[k] === target.area[k]);
 }
 
 // =====================================================================
@@ -915,7 +1029,7 @@ async function focusViewerTab(tab, why) {
     // El estudio llega a un visor ya iniciado: no se le cambia el tamano si tu
     // lo moviste a proposito (su calibracion corresponde a donde esta).
     const rec = state.managed[tab.id];
-    if (rec && rec.target && settings.placeViewer && !rec.userMovedAt && w.type === "popup") {
+    if (rec && rec.target && settings.placeViewer && (settings.keepInPlace || !rec.userMovedAt) && w.type === "popup") {
       await applyBounds(w.id, rec.target.bounds, `traer al frente (${why})`);
     }
     log("info", `Visor existente traído al frente (pestaña ${tab.id}, ${why}).`);
@@ -1198,24 +1312,31 @@ async function onViewerReport(tabId, rep, sender) {
     });
     return;
   }
-  if (rep.dprChanged) log("info", "La escala cambió antes de que el visor terminara de iniciar (sin riesgo).", rep.changes);
+  if (rep.dprChanged) log("info", "La escala cambió en algún momento pero volvió a la del inicio (sin riesgo).", rep.changes);
 
+  // Cada vez que el area del visor cambia de tamano (o la imagen se ve
+  // estirada), se le pide a Synapse reacomodar la imagen, como hace el boton.
+  // Sin tope fijo, pero no mas de una vez cada 3 s; si la imagen sigue
+  // deformada tras 2 intentos seguidos, se avisa.
   const distorted = rep.media && rep.media.distorted > 0;
-  if ((rep.sizeChangedAfterDcl || distorted) && (rec.relayouts || 0) < 2) {
-    upsertManaged(tabId, { relayouts: (rec.relayouts || 0) + 1 });
-    log("info", distorted ? "Imagen deformada en el visor: pidiendo a Synapse que recalcule el layout." : "El visor cambió de tamaño tras iniciar: recalculando layout.");
-    chrome.tabs.sendMessage(tabId, { type: "pacs-dm:relayout" }, { frameId: 0 }).catch(() => {});
-  } else if (distorted) {
+  const now = Date.now();
+  if (distorted && (rec.distortedTries || 0) >= 2) {
     noticeTab(tabId, "warn", "La imagen del visor se ve deformada (no se ajustó al tamaño de la ventana). Recarga el visor antes de medir.", {
       sticky: true,
       key: "distorted",
       actions: [{ id: "reload", label: "Recargar visor" }],
     });
+  } else if ((rep.sizeChangedAfterDcl || distorted) && now - (rec.lastRelayoutAt || 0) > 3000) {
+    upsertManaged(tabId, { lastRelayoutAt: now, distortedTries: distorted ? (rec.distortedTries || 0) + 1 : 0 });
+    log("info", distorted ? "Imagen deformada en el visor: pidiendo a Synapse que recalcule el layout." : "El visor cambió de tamaño: pidiendo a Synapse que reacomode la imagen.");
+    chrome.tabs.sendMessage(tabId, { type: "pacs-dm:relayout" }, { frameId: 0 }).catch(() => {});
+  } else if (!distorted && rec.distortedTries) {
+    upsertManaged(tabId, { distortedTries: 0 });
   }
 
-  if (rec.target && settings.placeViewer && Date.now() <= (rec.guardUntil || 0)) {
+  if (rec.target && settings.placeViewer && (settings.keepInPlace || Date.now() <= (rec.guardUntil || 0))) {
     const w = await chrome.windows.get(rec.windowId).catch(() => null);
-    if (w && G.boundsDelta(w, rec.target.bounds) > T.guardDriftPx) await applyBounds(rec.windowId, rec.target.bounds, "verificación");
+    if (w && w.type === "popup" && w.state !== "minimized" && displaced(w, rec)) await onBoundsChanged(w);
   }
 }
 
@@ -1242,8 +1363,9 @@ async function onViewportMeasured(tabId, msg, sender) {
   if (!vp || ![vp.left, vp.top, vp.width, vp.height].every(Number.isFinite)) return;
   const w = await chrome.windows.get(sender.tab.windowId).catch(() => null);
   if (!w || w.type !== "popup" || w.state !== "normal") return;
-  // Solo con la ventana donde la pusimos y con zoom 100% (px de la pagina = px de pantalla).
-  if (G.boundsDelta(w, rec.target.bounds) > T.exactPx) return;
+  // Solo con la ventana quieta donde la pusimos y con zoom 100% (px de la
+  // pagina = px de pantalla).
+  if (isOwn(w.id) || G.boundsDelta(w, rec.target.bounds) > T.exactPx) return;
   const zoom = await chrome.tabs.getZoom(tabId).catch(() => 1);
   if (Math.abs(zoom - 1) > 0.005) return;
   // Plausibilidad: el area de la pagina tiene que estar dentro de la ventana.
@@ -1285,16 +1407,18 @@ async function onViewportMeasured(tabId, msg, sender) {
   const why = describeOver(res.over);
   log("info", `Bordes ajustados: el visor ${why}.`, { sobrepasa: res.over, bordes: res.insets });
   const inUse = !!msg.hasInput || (rec.inputAt || 0) > (rec.navAt || 0);
-  if (!inUse) {
-    upsertManaged(tabId, { target: Object.assign({}, rec.target, { bounds: nb, insets: res.insets }) });
+  // Se ajusta solo si aun no usaste el visor, y como maximo una vez por estudio.
+  if (!inUse && !((rec.insetsFixedAt || 0) > (rec.navAt || 0))) {
+    upsertManaged(tabId, { target: Object.assign({}, rec.target, { bounds: nb, insets: res.insets }), restBounds: null, insetsFixedAt: Date.now() });
     await applyBounds(w.id, nb, "ajuste de bordes");
-  } else {
+  } else if (inUse) {
     noticeTab(tabId, "warn", `El visor ${why}. Quedó corregido para los próximos estudios; para ajustarlo ahora usa el botón (o Ctrl+Shift+Y).`, {
       sticky: true,
       key: "insets",
       actions: [{ id: "reposition", label: "Ajustar ahora" }],
     });
   }
+  // (Si ya se ajusto una vez en este estudio, la medida queda guardada para el proximo.)
 }
 
 // =====================================================================
@@ -1327,8 +1451,9 @@ async function repositionViewerNow(source, preferTabId) {
   const res = await placeTab(tab, target, `manual (${source})`, {
     role: "viewer",
     guardUntil: Date.now() + settings.guardSeconds * 1000,
-    reapplies: 0,
-    relayouts: 0,
+    fightRounds: 0,
+    keeperPausedUntil: 0,
+    distortedTries: 0,
     userMovedAt: 0,
   });
   await ensureZoom100(tab.id, "manual");
@@ -1425,6 +1550,17 @@ async function handleMessage(msg, sender) {
     case "pacs-dm:viewer-input":
       if (tabId != null && state.managed[tabId]) upsertManaged(tabId, { inputAt: Date.now() });
       return;
+    case "pacs-dm:scroll-fix": {
+      // La pagina del visor se habia desplazado (toda la imagen corrida).
+      if (tabId == null || !state.managed[tabId]) return;
+      const rec = state.managed[tabId];
+      const n = (rec.scrollFixes || 0) + 1;
+      upsertManaged(tabId, { scrollFixes: n });
+      const by = (msg.from || []).map((v) => Math.round(Number(v) || 0)).join(", ");
+      if (msg.gaveUp) log("warn", `La página del visor se sigue desplazando sola (${by} px): dejo de corregirla por un rato.`);
+      else if (n <= 10 || n % 10 === 0) log("info", `La página del visor estaba desplazada (${by} px): vuelve a su lugar (vez n.º ${n}).`);
+      return;
+    }
     case "pacs-dm:page-event": {
       if (tabId == null || !msg.event) return;
       const n = (pageEventCount.get(tabId) || 0) + 1;
@@ -1441,6 +1577,8 @@ async function handleMessage(msg, sender) {
       } else if (n <= 15) {
         if (ev.type === "window-call") {
           log("info", `Synapse intentó ${ev.name}(${(ev.args || []).join(", ")})${ev.blocked ? " — bloqueado" : ""}`);
+        } else if (ev.type === "fullscreen") {
+          log("info", `Synapse pidió pantalla completa${ev.blocked ? " — bloqueado (dejaría el visor en un solo monitor)" : ""}.`);
         } else if (ev.type === "dialog") {
           // El texto de otros alert() podria traer datos del paciente: no se guarda.
           log("info", `Synapse mostró un ${ev.name}().`);

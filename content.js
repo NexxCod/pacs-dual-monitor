@@ -12,6 +12,7 @@
 //   pueden quedar mal y el background decide recargar o avisar. Detecta
 //   pantalla negra por perdida del contexto grafico (WebGL), imagenes
 //   deformadas y errores HTTP. Bloquea el zoom accidental del navegador.
+//   Si la pagina del visor queda desplazada (scroll), la devuelve a su lugar.
 // - Muestra los avisos de la extension (esquina inferior izquierda).
 
 (() => {
@@ -48,7 +49,7 @@
   // Inicio real del documento (reloj absoluto), aunque el script se inyecte tarde.
   const docStart = Math.round(performance.timeOrigin || pageStart);
 
-  const DEFAULTS = { blockPageResize: true, forceZoom100: true, showNotices: true };
+  const DEFAULTS = { blockPageResize: true, forceZoom100: true, showNotices: true, keepInPlace: true };
   let settings = Object.assign({}, DEFAULTS);
 
   function send(msg) {
@@ -467,6 +468,42 @@
     }
 
     window.addEventListener("resize", check, true);
+
+    // La pagina del visor no debe quedar desplazada (scroll): si se corre (p.ej.
+    // Chrome la desplaza para mostrar un control enfocado), TODA la imagen
+    // queda corrida respecto de la pantalla. Se pide a Synapse reacomodar el
+    // layout (como el boton de la extension) y, si sigue corrida, vuelve al
+    // origen. Si algo la sigue desplazando, se deja de corregir por un rato.
+    let scrollTimer = null;
+    let scrollFixes = [];
+    let scrollPausedUntil = 0;
+    window.addEventListener(
+      "scroll",
+      () => {
+        if (scrollTimer || !settings.keepInPlace) return;
+        scrollTimer = setTimeout(fixScroll, 250);
+      },
+      { passive: true }
+    );
+    function fixScroll() {
+      scrollTimer = null;
+      const from = [window.scrollX, window.scrollY];
+      const now = Date.now();
+      if ((!from[0] && !from[1]) || now < scrollPausedUntil) return;
+      scrollFixes = scrollFixes.filter((t) => now - t < 10000);
+      if (scrollFixes.length >= 5) {
+        scrollPausedUntil = now + 60000;
+        send({ type: "pacs-dm:scroll-fix", from, gaveUp: true });
+        return;
+      }
+      scrollFixes.push(now);
+      relayout();
+      setTimeout(() => {
+        if (window.scrollX || window.scrollY) window.scrollTo({ left: 0, top: 0, behavior: "instant" });
+        send({ type: "pacs-dm:scroll-fix", from });
+      }, 350);
+    }
+
     (function watchDpr() {
       try {
         matchMedia("(resolution: " + window.devicePixelRatio + "dppx)").addEventListener(
@@ -575,7 +612,10 @@
         now: snap(),
         changes: changes.slice(-12),
         dprChanged: changes.some((c) => c.kind === "dpr"),
-        dprChangedAfterDcl: changes.some((c) => c.kind === "dpr" && c.phase !== "before-dcl"),
+        // Riesgo para las mediciones: la escala ACTUAL es distinta de la que
+        // tenia el visor al iniciar. Un cambio pasajero que volvio a su valor
+        // (p.ej. la ventana se movio y el mantenedor la devolvio) no cuenta.
+        dprChangedAfterDcl: !!dcl && Math.abs(window.devicePixelRatio - dcl.dpr) > 0.001,
         sizeChangedAfterDcl: changes.some((c) => c.kind === "size" && c.phase !== "before-dcl"),
         hasInput: inputAt > 0,
         blockedCalls,

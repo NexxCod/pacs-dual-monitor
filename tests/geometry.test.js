@@ -194,11 +194,12 @@ test("medición: el visor se pasaba 7 px hacia abajo -> borde inferior 0", () =>
   assert.equal(r.changed, true);
 });
 
-test("medición: un hueco se rellena dejando 1 px; dentro de tolerancia no cambia", () => {
+test("medición: solo achica bordes (un hueco no se rellena); sin exceso no cambia", () => {
   const area = { left: 1280, top: 0, right: 5120, bottom: 1040 };
   const gap = G.correctInsets(area, { left: 1281, top: 72, width: 3838, height: 1040 - 72 - 8 }, { left: 7, right: 7, bottom: 0 });
   assert.deepEqual(gap.over, { left: -1, right: -1, bottom: -8 });
-  assert.deepEqual(gap.insets, { left: 7, right: 7, bottom: 7 });
+  assert.deepEqual(gap.insets, { left: 7, right: 7, bottom: 0 });
+  assert.equal(gap.changed, false);
   const ok = G.correctInsets(area, { left: 1280, top: 72, width: 3840, height: 968 }, { left: 7, right: 7, bottom: 0 });
   assert.equal(ok.changed, false);
   const sides = G.correctInsets(area, { left: 1273, top: 72, width: 3854, height: 968 }, { left: 7, right: 7, bottom: 0 });

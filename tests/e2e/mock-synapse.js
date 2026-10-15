@@ -9,7 +9,8 @@
 //                           (como un visor que calibra al abrir el estudio),
 //                           latido del candado, recibe estudios, "restaura"
 //                           su posicion con resizeTo/moveTo tras cargar.
-//   flags: zombie (no recibe estudios), webgl (canvas WebGL), goodResize.
+//   flags: zombie (no recibe estudios), webgl (canvas WebGL), goodResize,
+//   tall (pagina desplazable), iframe, selfWarn, status.
 // - /img                    datos de imagen (20 KB).
 
 const https = require("node:https");
@@ -109,6 +110,12 @@ const VIEWER = `<!doctype html><html><head><meta charset="utf-8"><title>Visor</t
     S.resizes.push({ t: Date.now() - S.t0, w: innerWidth, h: innerHeight, ow: outerWidth, oh: outerHeight, sx: screenX, sy: screenY, dpr: devicePixelRatio, trusted: e.isTrusted });
     if (params.has('goodResize')) { c.width = Math.round(innerWidth * devicePixelRatio); c.height = Math.round(innerHeight * devicePixelRatio); draw(); }
   });
+  if (params.has('tall')) {
+    // Contenido mas alto que la ventana: la pagina se puede desplazar.
+    var tall = document.createElement('div');
+    tall.style.cssText = 'position:absolute;left:0;top:0;width:10px;height:250%';
+    document.body.appendChild(tall);
+  }
   if (params.has('iframe')) {
     // Visor que dibuja dentro de un iframe del mismo origen.
     var f = document.createElement('iframe');

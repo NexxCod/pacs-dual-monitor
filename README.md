@@ -9,6 +9,20 @@ Se instala una vez y funciona sola. No cambia tu flujo de trabajo.
 
 ---
 
+## Novedad de la versión 2.0.2: el visor se mantiene solo en su lugar
+
+Antes, si algo movía o achicaba la ventana del visor pasados los primeros segundos (al interactuar con Synapse, su agente, otra extensión o Windows), había que apretar el ícono de la extensión (o Ctrl+Shift+Y) para volver a ubicarlo. Ahora la extensión lo vigila **todo el tiempo**:
+
+- Si la ventana del visor **se mueve, cambia de tamaño (aunque sea unos pocos píxeles), se maximiza o pasa a pantalla completa**, vuelve sola a su lugar en una fracción de segundo y se le pide a Synapse reacomodar la imagen (lo mismo que hace el botón).
+- Si la **página del visor queda desplazada** (toda la imagen corrida, por ejemplo cuando Chrome desplaza la página para mostrar un control), vuelve a su lugar.
+- La **pantalla completa pedida por Synapse** se bloquea: dejaría el visor en un solo monitor.
+- Si **otro programa insiste** en mover la ventana (la devuelve y la vuelve a mover una y otra vez), la extensión deja de pelear por un minuto y te avisa. El registro de *Opciones* muestra qué la movió.
+- Si cambian los monitores (se apaga uno, se conecta el dock), no pelea con Windows: espera a que se estabilicen y recién ahí reubica el visor.
+- La medición automática de bordes es más prudente: solo achica la ventana cuando se pasa de la pantalla (nunca la agranda por una medida), una vez por estudio y nunca mientras la ventana se está moviendo.
+- Para mover el visor a mano, desactiva **Mantener el visor siempre en su lugar** en *Opciones*.
+
+---
+
 ## ¿Qué cambió en la versión 2.0?
 
 ### 1. Dimensiones correctas → mediciones confiables
@@ -19,12 +33,12 @@ Eso es justo lo que pasaba con la versión anterior: el visor **nacía en el not
 
 Ahora:
 
-- **La ventana se ubica en los dos externos *antes* de que cargue el visor** (desde que aparece la lanzadera). El visor nace con su tamaño y escala finales y no se vuelve a tocar.
+- **La ventana se ubica en los dos externos *antes* de que cargue el visor** (desde que aparece la lanzadera). El visor nace con su tamaño y escala finales.
 - **Se bloquea el "restaurar posición" de Synapse** (sus llamadas `moveTo`/`resizeTo`), que dejaba la ventana en un solo monitor.
-- **Guardia**: si otro programa mueve la ventana mientras el visor carga, se restaura al instante. Pasados unos segundos, si tú la mueves, se respeta.
+- **Siempre en su lugar** (2.0.2): si algo mueve, achica, maximiza o pone en pantalla completa la ventana, vuelve sola a su lugar.
 - **Zoom de Synapse fijo en 100%**. En el visor, Ctrl+rueda, Ctrl+ y Ctrl− ya no hacen zoom al navegador (Synapse sigue recibiendo esas teclas).
 - **El visor informa su escala**: si cambió *después* de abrir el estudio, se recarga solo (si aún no lo usaste) o te avisa con un botón **Recargar visor**, para no medir sobre un visor mal calibrado.
-- **El visor nunca se pasa del borde de la pantalla**: con el primer movimiento del mouse sobre el visor, la extensión mide dónde quedó de verdad el área del visor; si se pasa (por ejemplo hacia abajo) o deja un hueco, corrige la ventana y recuerda esa medida para los próximos estudios. Si ya estabas usando el visor no lo mueve: te ofrece **Ajustar ahora**.
+- **El visor nunca se pasa del borde de la pantalla**: con el primer movimiento del mouse sobre el visor, la extensión mide dónde quedó de verdad el área del visor; si se pasa (por ejemplo hacia abajo), corrige la ventana y recuerda esa medida para los próximos estudios. Si ya estabas usando el visor no lo mueve: te ofrece **Ajustar ahora**.
 - **Detecta imagen deformada** (contenido estirado) y le pide a Synapse recalcular; si persiste, te avisa.
 - **Avisa si la escala de Windows no es 100%** en los monitores del visor (aviso rojo y "!" en el ícono).
 - **Mejor elección de monitores**: los dos externos iguales y contiguos, aunque el principal de Windows sea un externo o tengas el notebook cerrado. La ventana ya no queda debajo de la barra de tareas. Si en Windows el notebook quedó *entre* los dos externos, usa uno solo y te avisa para que reordenes las pantallas (antes la ventana pasaba por encima del notebook).
@@ -66,7 +80,7 @@ Requiere Chrome o Edge 111 o superior.
 
 La página de **Opciones** muestra la escala de cada monitor y te avisa si algo no cumple.
 
-> Nota: como la extensión impide que Synapse mueva la ventana del visor, la tecla F11 de Synapse ("volver al tamaño guardado") deja de mover la ventana. Usa **Ctrl+Shift+Y**.
+> Nota: como la extensión mantiene el visor en su lugar, no se puede mover, maximizar ni poner en pantalla completa (F11) mientras **Mantener el visor siempre en su lugar** esté activa: vuelve solo. Si necesitas moverlo a mano, desactiva esa opción. **Ctrl+Shift+Y** lo reubica en cualquier momento.
 
 ---
 
@@ -82,7 +96,8 @@ La página de **Opciones** muestra la escala de cada monitor y te avisa si algo 
 |---|---|---|
 | Ubicar el visor en los monitores externos | Sí | Función principal. |
 | Ubicar desde que aparece la lanzadera | Sí | El visor nace con su tamaño y escala finales (recomendado). |
-| Impedir que Synapse mueva o achique la ventana | Sí | Evita que el "restaurar posición" de Synapse la deje en un monitor. |
+| Mantener el visor siempre en su lugar | Sí | Si algo mueve, achica, maximiza o pone en pantalla completa la ventana, o desplaza la página, vuelve sola y la imagen se reacomoda. Desactívala solo si necesitas mover el visor a mano. |
+| Impedir que Synapse mueva, achique o ponga en pantalla completa la ventana | Sí | Evita que el "restaurar posición" o la pantalla completa de Synapse lo dejen en un monitor. |
 | Mantener el zoom en 100% | Sí | Synapse lo exige para medir. Bloquea Ctrl+rueda / Ctrl+ / Ctrl− en el visor. |
 | Recargar el visor solo si quedó mal | Sí | Solo si aún no lo usaste; si no, te avisa con botón. |
 | Verificar que el estudio abra | Sí | Maneja el aviso "abierta en otra ventana", reintenta y cierra visores zombie. |
@@ -90,7 +105,7 @@ La página de **Opciones** muestra la escala de cada monitor y te avisa si algo 
 | Mostrar avisos en pantalla | Sí | Los errores se muestran siempre. |
 | Si hay un solo monitor externo, usarlo solo | No | Útil si a veces trabajas con un solo externo. |
 | Borde invisible de Windows (lados, valor inicial) | 7 px | Punto de partida para los lados (abajo parte en 0). Después se usan los bordes medidos en tu equipo; en *Monitores* puedes **Volver a medir los bordes**. |
-| Guardia tras cargar el visor | 12 s | Tiempo en que se corrige cualquier movimiento de la ventana. |
+| Sin «mantener siempre»: proteger tras cargar | 12 s | Solo si desactivas «mantener siempre»: segundos tras cargar el visor en que igual se corrige cualquier movimiento. |
 | Monitores del visor | Automático | En la tabla de monitores puedes marcar a mano cuáles usar. |
 
 ---
@@ -98,7 +113,7 @@ La página de **Opciones** muestra la escala de cada monitor y te avisa si algo 
 ## Si algo no funciona
 
 1. Abre **Opciones** y revisa la sección *Monitores* (escala 100% en los externos) y *Visor y lanzamientos*.
-2. Usa **Copiar diagnóstico** y envíamelo. El registro no guarda datos del paciente: las direcciones se guardan sin parámetros y no se guardan títulos de ventana.
+2. Usa **Copiar diagnóstico** y envíamelo. El registro muestra qué movió el visor (por ejemplo *"Algo movió o cambió el tamaño de la ventana del visor… vuelve a su lugar"*, *"Synapse intentó resizeTo… bloqueado"* o *"La página del visor estaba desplazada"*). No guarda datos del paciente: las direcciones se guardan sin parámetros y no se guardan títulos de ventana.
 3. Para más detalle: `chrome://extensions` → PACS Dual Monitor → **Inspeccionar service worker** (consola con los mensajes `[PACS]`).
 
 ---
@@ -109,6 +124,7 @@ La página de **Opciones** muestra la escala de cada monitor y te avisa si algo 
 - Extremo a extremo en Chromium real contra un Synapse simulado (Linux, requiere Xvfb, openssl y Playwright):
   `npm install` y luego `npm run test:e2e`. La prueba de bordes mueve el mouse real con python-xlib
   (`pip install python-xlib`; si no está, se omite). Para usar otro Python: `PACS_PYTHON=/ruta/python`.
+  Con `PACS_DUMP_LOG=1` se muestra el registro de la extensión de cada prueba.
 
 ---
 
