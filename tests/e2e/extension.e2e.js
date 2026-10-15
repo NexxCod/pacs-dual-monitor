@@ -810,7 +810,7 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 6000
       self.__fighter = setInterval(() => chrome.windows.update(id, { left: 100, top: 100, width: 800, height: 600 }).catch(() => {}), 250);
     }, win.windowId);
     try {
-      await waitFor(async () => /Otro programa sigue moviendo la ventana del visor: dejo de corregirla/.test(await logText()), {
+      await waitFor(async () => /Otro programa sigue moviendo la ventana del visor[^\n]*dejo de corregirla/.test(await logText()), {
         timeout: 20000,
         what: "pausa por pelea",
       });
@@ -923,7 +923,7 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 6000
     await waitFor(() => imageFits(page), { timeout: 6000, what: "reacomodada al soltar" });
     // Un panel (imagen más chica a propósito): un intento y se acepta, sin insistir.
     await page.evaluate(() => window.togglePanel());
-    await waitFor(async () => /al reacomodarla no cambia: se deja así/.test(await logText()), { timeout: 8000, what: "panel aceptado" });
+    await waitFor(async () => /al reacomodarla no cambia: se deja así/.test(await logText()), { timeout: 15000, what: "panel aceptado" });
     const n1 = await synthResizes(page);
     await sleep(4000);
     assert.equal(await synthResizes(page), n1, "no insiste con un layout que Synapse quiere así");
@@ -932,6 +932,96 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 6000
     const r = await swEval(() => repositionViewerNow("prueba"));
     assert.equal(r.ok, true);
     await waitFor(async () => /Botón: cómo estaba el visor antes y cómo quedó/.test(await logText()), { timeout: 4000, what: "registro del botón" });
+  });
+
+  it("Z3) cambiar imágenes muy seguido nunca detiene el aviso del tamaño real; solo un bucle real de Synapse lo pausa", async () => {
+    await setSettings({ keepInPlace: false }); // solo el aviso del tamaño real
+    await worklist.evaluate(() => window.openStudy("Z3", "popup", "layoutBug=restore"));
+    const page = await waitViewer("Z3");
+    await waitFor(() => imageFits(page), { timeout: 3000, what: "imagen bien al abrir" });
+    // 10 cambios de imagen seguidos, usando el visor entre medio (20 llamadas bloqueadas en ~6 s).
+    for (let i = 0; i < 10; i++) {
+      await page.mouse.click(600 + i * 10, 400);
+      await page.evaluate(() => window.changeImage());
+      await sleep(600);
+    }
+    await waitFor(() => imageFits(page), { timeout: 2500, what: "imagen bien tras cambiar imágenes seguido" });
+    assert.doesNotMatch(await logText(), /se deja de avisar/);
+    // Bucle real: Synapse vuelve a pedir su tamaño apenas recibe el aviso.
+    await resetWorld();
+    await worklist.evaluate(() => window.openStudy("Z3b", "popup", "resizeLoop=1"));
+    const page2 = await waitViewer("Z3b");
+    await waitFor(async () => /bucle\): se deja de avisar por 30 s/.test(await logText()), { timeout: 8000, what: "pausa del bucle" });
+    const calls = await page2.evaluate(() => window.__viewer.loopCalls || 0);
+    await sleep(2000);
+    assert.ok((await page2.evaluate(() => window.__viewer.loopCalls || 0)) - calls <= 2, "el bucle se detuvo");
+  });
+
+  it("Z4) si otro programa mueve la ventana cada vez que usas el visor, se devuelve siempre (no es pelea)", async () => {
+    await worklist.evaluate(() => window.openStudy("Z4", "popup"));
+    const page = await waitViewer("Z4");
+    const win = await viewerWindow(page);
+    for (let i = 0; i < 8; i++) {
+      await page.mouse.click(500 + i * 20, 500);
+      await sleep(150);
+      await swEval((id) => chrome.windows.update(id, { left: 100, top: 100, width: 800, height: 600 }), win.windowId);
+      await waitFor(async () => near((await viewerWindow(page)).bounds, TARGET), { timeout: 3000, what: `devuelta (vez ${i + 1})` });
+    }
+    const log = await logText();
+    assert.doesNotMatch(log, /dejo de corregirla/);
+    assert.match(log, /vuelve a su lugar \(vez n\.º 8\)/);
+  });
+
+  it("Z5) verificación periódica: si un cambio de la ventana no llega como evento, igual vuelve a su lugar", async () => {
+    await worklist.evaluate(() => window.openStudy("Z5", "popup"));
+    const page = await waitViewer("Z5");
+    const win = await viewerWindow(page);
+    await sleep(1500);
+    // El evento de este cambio se ignora (como si Chrome no avisara).
+    await swEval((id) => {
+      markOwn(id, 1500);
+      return chrome.windows.update(id, { left: 120, top: 80, width: 900, height: 700 });
+    }, win.windowId);
+    await sleep(300);
+    assert.ok(!near((await viewerWindow(page)).bounds, TARGET), "quedó movida");
+    await waitFor(async () => near((await viewerWindow(page)).bounds, TARGET), { timeout: 6000, what: "devuelta por la verificación periódica" });
+  });
+
+  it("Z6) el botón avisa qué estaba mal y permite copiar el diagnóstico (sin datos del paciente)", async () => {
+    await setSettings({ keepInPlace: false, guardSeconds: 0 });
+    await worklist.evaluate(() => window.openStudy("Z6", "popup"));
+    const page = await waitViewer("Z6");
+    const win = await viewerWindow(page);
+    await swEval(() => {
+      self.__notices = [];
+      self.__origNoticeTab = noticeTab;
+      noticeTab = (...a) => {
+        self.__notices.push(a);
+        return self.__origNoticeTab(...a);
+      };
+    });
+    try {
+      await sleep(500);
+      await swEval((id) => chrome.windows.update(id, { left: 100, top: 100, width: 900, height: 700 }), win.windowId);
+      await sleep(800);
+      const r = await swEval(() => repositionViewerNow("prueba"));
+      assert.equal(r.ok, true);
+      const n = await waitFor(
+        () => swEval(() => self.__notices.find((a) => a[3] && a[3].key === "manual" && (a[3].actions || []).some((x) => x.id === "copy-diag"))),
+        { timeout: 4000, what: "aviso del botón" }
+      );
+      assert.match(n[2], /Estaba mal: la ventana estaba en 100,100 900×700/);
+      assert.match(n[2], /Opciones desactivadas: «Mantener el visor siempre en su lugar»/);
+    } finally {
+      await swEval(() => {
+        if (self.__origNoticeTab) noticeTab = self.__origNoticeTab;
+        self.__origNoticeTab = null;
+      });
+    }
+    const diag = JSON.parse(await swEval(() => buildDiagnostic()));
+    assert.equal(diag.version, await swEval(() => chrome.runtime.getManifest().version));
+    assert.equal(diag.opcionesCambiadas.keepInPlace, false);
+    assert.doesNotMatch(JSON.stringify(diag), /study=Z6/, "sin parámetros de la dirección");
   });
 
   it("T) reinyección al instalar/actualizar con Synapse abierto: no duplica y reemplaza instancias desconectadas", async () => {

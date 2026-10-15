@@ -9,7 +9,18 @@ Se instala una vez y funciona sola. No cambia tu flujo de trabajo.
 
 ---
 
-## Novedad de la versión 2.0.3: la imagen queda siempre del tamaño de la ventana
+## Novedad de la versión 2.0.4: el visor no se suelta mientras lo usas
+
+El visor debe quedar siempre como lo deja el botón de reubicar. Las versiones anteriores tenían "frenos" para no pelear sin fin con otro programa; usando el visor normalmente (por ejemplo, cambiando imágenes seguido) esos frenos podían activarse y dejar el visor mal hasta apretar el botón, que los reiniciaba. Ahora:
+
+- **Mientras usas el visor, nunca se rinde**: si algo cambia la ventana o la imagen cada vez que cambias de imagen o de estudio, se corrige cada vez. Solo se pausa (30 s) ante un bucle real: otro programa que la mueve una y otra vez **sin** que estés usando el visor.
+- Además de reaccionar a cada cambio, **revisa cada 3 segundos** y cada vez que vuelves al visor desde otra ventana.
+- Una imagen que se sale de la ventana **nunca** se da por buena (solo una imagen más chica puede ser a propósito, por ejemplo con un panel abierto).
+- **Al apretar el botón aparece un aviso que dice qué estaba mal** (la ventana, el zoom, la página o la imagen), con un botón **Copiar diagnóstico** para enviarlo.
+
+---
+
+## Versión 2.0.3: la imagen queda siempre del tamaño de la ventana
 
 Si tenías que apretar el botón de la extensión cada vez que recargabas, cambiabas de imagen o manipulabas el estudio, la causa era esta: Synapse, al abrir un estudio o cambiar imágenes, intenta devolver la ventana a su tamaño "guardado". La extensión bloquea ese intento (si no, el visor quedaría en un solo monitor), pero Synapse igual acomodaba la imagen para el tamaño que pidió, y solo se corregía cuando algo le avisaba el tamaño real de la ventana, que es justo lo que hace el botón. Ahora:
 
@@ -124,7 +135,7 @@ La página de **Opciones** muestra la escala de cada monitor y te avisa si algo 
 ## Si algo no funciona
 
 1. Abre **Opciones** y revisa la sección *Monitores* (escala 100% en los externos) y *Visor y lanzamientos*.
-2. Si la imagen se ve mal, aprieta **una vez** el botón de la extensión (o Ctrl+Shift+Y) y luego usa **Copiar diagnóstico** y envíamelo: queda registrado cómo estaba el visor antes del botón y cómo quedó. El registro también muestra qué movió el visor (por ejemplo *"Algo movió o cambió el tamaño de la ventana del visor… vuelve a su lugar"*, *"Synapse intentó resizeTo… bloqueado; se le avisa el tamaño real"* o *"La imagen del visor quedó fuera de la ventana… reacomodada"*). No guarda datos del paciente: las direcciones se guardan sin parámetros y no se guardan títulos de ventana.
+2. Si el visor se ve mal, aprieta **una vez** el botón de la extensión (o Ctrl+Shift+Y): aparece un aviso que dice qué estaba mal, con el botón **Copiar diagnóstico** (también está en *Opciones*). Envíamelo: queda registrado cómo estaba el visor antes del botón y cómo quedó. El registro también muestra qué movió el visor (por ejemplo *"Algo movió o cambió el tamaño de la ventana del visor… vuelve a su lugar"*, *"Synapse intentó resizeTo… bloqueado; se le avisa el tamaño real"* o *"La imagen del visor quedó fuera de la ventana… reacomodada"*). No guarda datos del paciente: las direcciones se guardan sin parámetros y no se guardan títulos de ventana.
 3. Si aun así la imagen queda mal, prueba desactivar **Impedir que Synapse mueva, achique o ponga en pantalla completa la ventana**: Synapse podrá mover la ventana y la extensión la devolverá al instante a los dos monitores (como la versión 1).
 4. Para más detalle: `chrome://extensions` → PACS Dual Monitor → **Inspeccionar service worker** (consola con los mensajes `[PACS]`).
 

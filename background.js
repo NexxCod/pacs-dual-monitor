@@ -60,7 +60,7 @@ const T = {
   keeperVerifyMs: 700, // verificacion tras cada reubicacion propia
   fightWindowMs: 1500, // si la vuelven a mover antes de esto, es una "pelea"
   fightMaxRounds: 5,
-  fightPauseMs: 60000,
+  fightPauseMs: 30000,
   restMaxPx: 30, // hasta aqui una diferencia se atribuye a un limite de Windows
   applyRetries: 2,
   settlePollMs: 40,
@@ -285,6 +285,7 @@ async function noticeTab(tabId, level, text, opts) {
     sticky: !!opts.sticky,
     actions: opts.actions || [],
     key: opts.key,
+    ttl: opts.ttl,
   };
   try {
     await chrome.tabs.sendMessage(tabId, payload, { frameId: 0 });
@@ -791,6 +792,17 @@ const guardTimers = new Map();
 
 chrome.windows.onBoundsChanged.addListener((win) => track(onBoundsChanged(win)));
 
+// Al volver al visor (p.ej. desde la worklist) se confirma que siga en su lugar.
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+  track(
+    (async () => {
+      await ready;
+      if (settings.keepInPlace && managedByWindow(windowId)) await verifyInPlace(windowId);
+    })()
+  );
+});
+
 // Fuera de su lugar: cualquier diferencia de mas de 3 px ya cambia las
 // mediciones. Si Windows no la dejo llegar exacta al destino, su lugar es
 // donde quedo (asi no se insiste en bucle).
@@ -825,17 +837,21 @@ async function onBoundsChanged(win) {
     guardTimers.set(win.id, setTimeout(() => track(restoreWindow(win.id)), T.keeperDelayMs));
     return;
   }
-  // "Pelea": otro programa la vuelve a mover apenas la devolvemos.
-  const fighting = rec.lastRestoreAt && now - rec.lastRestoreAt < T.fightWindowMs;
+  // "Pelea": otro programa la vuelve a mover apenas la devolvemos, sin que
+  // hayas usado el visor. Si la mueve porque cambiaste de imagen o de
+  // estudio (aunque sea muy seguido), no es pelea: se devuelve siempre.
+  const usedRecently = (rec.inputAt || 0) > (rec.lastRestoreAt || 0) - 1000;
+  const fighting = rec.lastRestoreAt && now - rec.lastRestoreAt < T.fightWindowMs && !usedRecently;
   const rounds = fighting ? (rec.fightRounds || 0) + 1 : 0;
   if (rounds >= T.fightMaxRounds) {
     upsertManaged(rec.tabId, { keeperPausedUntil: now + T.fightPauseMs, fightRounds: 0 });
-    log("warn", "Otro programa sigue moviendo la ventana del visor: dejo de corregirla por 1 minuto.", box(win));
+    log("warn", "Otro programa sigue moviendo la ventana del visor (sin que lo uses): dejo de corregirla por 30 s.", box(win));
     warnOnce(
       `fight:${rec.tabId}`,
       rec.tabId,
       "warn",
-      "Otro programa sigue moviendo la ventana del visor (¿la extensión de Fujifilm Synapse o el agente de Synapse?). Dejo de corregirla por un minuto; Ctrl+Shift+Y la reubica."
+      "Otro programa sigue moviendo la ventana del visor (¿la extensión de Fujifilm Synapse o el agente de Synapse?). Dejo de corregirla por 30 segundos; Ctrl+Shift+Y la reubica.",
+      { actions: [{ id: "copy-diag", label: "Copiar diagnóstico" }] }
     );
     // Pasada la pausa, se vuelve a revisar aunque nada la mueva de nuevo.
     const windowId = win.id;
@@ -1348,6 +1364,37 @@ async function onViewerReport(tabId, rep, sender) {
   }
 }
 
+// Que corrigio el boton (para el aviso): ventana, zoom, pagina e imagen.
+function describeButtonFix(winBefore, winAfter, before, after, zoomBefore) {
+  const parts = [];
+  const r = (b) => `${b.left},${b.top} ${b.width}×${b.height}`;
+  if (winBefore && winAfter && (winBefore.state !== "normal" || G.boundsDelta(winBefore, winAfter) > T.exactPx)) {
+    parts.push(`la ventana estaba en ${r(winBefore)}${winBefore.state !== "normal" ? ` (${winBefore.state})` : ""} y quedó en ${r(winAfter)}`);
+  }
+  if (zoomBefore && Math.abs(zoomBefore - 1) > 0.005) parts.push(`el zoom estaba en ${pct(zoomBefore)}`);
+  const pb = before && before.pagina;
+  const pa = after && after.pagina;
+  if (pb && pa && (pb.w !== pa.w || pb.h !== pa.h)) parts.push(`el área de la página era ${pb.w}×${pb.h} y quedó ${pa.w}×${pa.h}`);
+  if (pb && pa && Math.abs(pb.dpr - pa.dpr) > 0.001) parts.push(`la escala era ${pct(pb.dpr)} y quedó ${pct(pa.dpr)}`);
+  if (pb && pb.scroll && (pb.scroll[0] || pb.scroll[1])) parts.push(`la página estaba desplazada (${pb.scroll.join(", ")} px)`);
+  const ib = before && before.imagen;
+  const ia = after && after.imagen;
+  const a = (u) => `${u.l},${u.t} → ${u.r},${u.b}`;
+  if (ib && ia && (ib.l !== ia.l || ib.t !== ia.t || ib.r !== ia.r || ib.b !== ia.b)) parts.push(`la imagen ocupaba ${a(ib)} y quedó ${a(ia)}`);
+  else if (before && before.problema) parts.push(`la imagen estaba ${describeArea(before.problema)}`);
+  return parts;
+}
+
+// Opciones importantes que, desactivadas, impiden mantener el visor solo.
+function disabledKeyOptions() {
+  const off = [];
+  if (!settings.placeViewer) off.push("«Ubicar el visor en los monitores externos»");
+  if (!settings.keepInPlace) off.push("«Mantener el visor siempre en su lugar»");
+  if (!settings.blockPageResize) off.push("«Impedir que Synapse mueva… la ventana»");
+  if (!settings.forceZoom100) off.push("«Mantener el zoom en 100%»");
+  return off;
+}
+
 // Como quedo la imagen de Synapse respecto de la ventana (para el registro).
 function describeArea(p) {
   if (!p) return "fuera de lugar";
@@ -1475,6 +1522,7 @@ async function repositionViewerNow(source, preferTabId) {
     distortedTries: 0,
     userMovedAt: 0,
   });
+  const zoomBefore = await chrome.tabs.getZoom(tab.id).catch(() => 1);
   await ensureZoom100(tab.id, "manual");
   chrome.tabs.sendMessage(tab.id, { type: "pacs-dm:relayout", manual: true }, { frameId: 0 }).catch(() => {});
   setTimeout(
@@ -1489,6 +1537,18 @@ async function repositionViewerNow(source, preferTabId) {
             antes: before,
             despues: after,
           });
+          const fixed = describeButtonFix(winBefore, winAfter, before, after, zoomBefore);
+          const off = disabledKeyOptions();
+          noticeTab(
+            tab.id,
+            fixed.length ? "warn" : "info",
+            (fixed.length
+              ? "Visor reubicado. Estaba mal: " + fixed.join("; ") + "."
+              : "Visor reubicado (ventana, página e imagen ya estaban en su lugar).") +
+              (off.length ? `\nOpciones desactivadas: ${off.join(", ")}.` : "") +
+              `\nSi vuelve a pasar, copia el diagnóstico y envíalo (v${chrome.runtime.getManifest().version}).`,
+            { key: "manual", ttl: 30000, actions: [{ id: "copy-diag", label: "Copiar diagnóstico" }] }
+          );
         })()
       ),
     1500
@@ -1586,6 +1646,14 @@ async function handleMessage(msg, sender) {
     case "pacs-dm:viewer-input":
       if (tabId != null && state.managed[tabId]) upsertManaged(tabId, { inputAt: Date.now() });
       return;
+    case "pacs-dm:viewer-tick": {
+      // Cada 3 s: la ventana sigue donde la dejo el boton?
+      const rec = tabId != null ? state.managed[tabId] : null;
+      if (rec && rec.windowId != null && settings.keepInPlace) await verifyInPlace(rec.windowId);
+      return;
+    }
+    case "pacs-dm:diagnostic":
+      return buildDiagnostic();
     case "pacs-dm:area-fix": {
       // La imagen de Synapse quedo fuera de la ventana (o mucho mas chica).
       if (tabId == null || !state.managed[tabId]) return;
@@ -1648,7 +1716,7 @@ async function handleMessage(msg, sender) {
           );
         }
       } else if (ev.type === "resync-paused") {
-        log("warn", "Synapse vuelve a pedir otro tamaño cada vez que se le avisa el real: se deja de avisar por 1 minuto.");
+        log("warn", "Synapse vuelve a pedir otro tamaño apenas se le avisa el real, sin que uses el visor (bucle): se deja de avisar por 30 s.");
       } else if (n <= 15) {
         if (ev.type === "fullscreen") {
           log("info", `Synapse pidió pantalla completa${ev.blocked ? " — bloqueado (dejaría el visor en un solo monitor)" : ""}.`);
@@ -1691,6 +1759,34 @@ async function handleMessage(msg, sender) {
     default:
       return;
   }
+}
+
+// Diagnostico para soporte: estado, opciones y registro. Sin datos del
+// paciente (direcciones sin parametros, sin titulos de ventana).
+async function buildDiagnostic() {
+  const st = await getStatus();
+  const changed = {};
+  for (const [k, v] of Object.entries(st.settings)) {
+    if (JSON.stringify(v) !== JSON.stringify(DEFAULT_SETTINGS[k])) changed[k] = v;
+  }
+  return JSON.stringify(
+    {
+      generado: new Date().toISOString(),
+      version: st.version,
+      navegador: navigator.userAgent,
+      opcionesCambiadas: changed,
+      opciones: st.settings,
+      monitores: st.displays,
+      eleccion: st.pick,
+      bordes: { usados: st.insets, medidos: st.learnedInsets },
+      visores: st.managed,
+      lanzamientos: st.launches,
+      alertas: st.alerts,
+      registro: st.log.slice(-300),
+    },
+    null,
+    2
+  );
 }
 
 async function getStatus() {

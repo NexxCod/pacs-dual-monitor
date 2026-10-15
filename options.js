@@ -273,22 +273,13 @@
   });
 
   $("#btn-copy").addEventListener("click", async () => {
-    const st = last || (await getStatus());
-    const diag = {
-      generado: new Date().toISOString(),
-      version: st.version,
-      navegador: navigator.userAgent,
-      opciones: st.settings,
-      monitores: st.displays,
-      eleccion: st.pick,
-      bordes: { usados: st.insets, medidos: st.learnedInsets },
-      visores: st.managed,
-      lanzamientos: st.launches,
-      alertas: st.alerts,
-      registro: st.log.slice(-200),
-    };
+    const text = await chrome.runtime.sendMessage({ type: "pacs-dm:diagnostic" }).catch(() => null);
+    if (typeof text !== "string") {
+      flash("#action-msg", "No pude generar el diagnóstico.");
+      return;
+    }
     try {
-      await navigator.clipboard.writeText(JSON.stringify(diag, null, 2));
+      await navigator.clipboard.writeText(text);
       flash("#action-msg", "Diagnóstico copiado. Pégalo en un correo o mensaje.");
     } catch (e) {
       flash("#action-msg", "No pude copiar al portapapeles.");

@@ -58,25 +58,40 @@
 
   // Tras una llamada bloqueada: avisar a Synapse el tamano real ("resize"),
   // varias veces porque Synapse puede terminar de acomodar la imagen un poco
-  // despues. Si Synapse vuelve a pedir el cambio en cada "resize" (bucle), se
-  // deja de insistir por un minuto.
+  // despues. Siempre, salvo un bucle real: Synapse vuelve a pedir el cambio
+  // apenas recibe el aviso, una y otra vez, sin que hayas tocado el visor.
+  // Cambiar imagenes o estudios (aunque sea muy seguido) nunca lo detiene.
+  let lastInputAt = 0;
+  for (const type of ["pointerdown", "keydown", "wheel"]) {
+    window.addEventListener(
+      type,
+      (e) => {
+        if (e.isTrusted) lastInputAt = Date.now();
+      },
+      { capture: true, passive: true }
+    );
+  }
   let resyncTimers = [];
-  let resyncTimes = [];
+  let lastResyncAt = 0;
+  let feedback = 0;
   let resyncPausedUntil = 0;
   function resync() {
     const now = Date.now();
     if (now < resyncPausedUntil) return;
-    resyncTimes = resyncTimes.filter((t) => now - t < 10000);
-    if (resyncTimes.length >= 12) {
-      resyncPausedUntil = now + 60000;
+    feedback = now - lastResyncAt < 400 && lastInputAt < lastResyncAt ? feedback + 1 : 0;
+    if (feedback >= 6) {
+      resyncPausedUntil = now + 30000;
+      feedback = 0;
+      resyncTimers.forEach(clearTimeout);
+      resyncTimers = [];
       stats.resyncPaused++;
       emit("resync-paused", {});
       return;
     }
-    resyncTimes.push(now);
     resyncTimers.forEach(clearTimeout);
     resyncTimers = [150, 600, 1500].map((ms) =>
       setTimeout(() => {
+        lastResyncAt = Date.now();
         stats.resyncs++;
         try {
           window.dispatchEvent(new Event("resize"));

@@ -168,7 +168,8 @@
           const b = document.createElement("button");
           b.textContent = a.label;
           b.addEventListener("click", () => {
-            send({ type: "pacs-dm:action", id: a.id });
+            if (a.id === "copy-diag") copyDiagnostic();
+            else send({ type: "pacs-dm:action", id: a.id });
             close();
           });
           acts.append(b);
@@ -185,7 +186,37 @@
       items.set(key, el);
       s.append(el);
       while (s.children.length > 4) s.firstElementChild.remove();
-      if (!n.sticky) setTimeout(close, n.level === "info" ? 7000 : 15000);
+      if (!n.sticky) setTimeout(close, n.ttl || (n.level === "info" ? 7000 : 15000));
+    }
+
+    // Copia el diagnostico (sin datos del paciente) para pegarlo en un
+    // correo o en el chat de soporte.
+    async function copyDiagnostic() {
+      const text = await send({ type: "pacs-dm:diagnostic" });
+      if (typeof text !== "string") return;
+      let ok = false;
+      try {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+      } catch (e) {
+        try {
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          ta.setAttribute("style", "position:fixed;left:-9999px;top:0;opacity:0");
+          (document.body || document.documentElement).appendChild(ta);
+          ta.select();
+          ok = document.execCommand("copy");
+          ta.remove();
+        } catch (err) { /* nada */ }
+      }
+      show({
+        level: ok ? "info" : "warn",
+        key: "copy-diag",
+        text: ok
+          ? "Diagnóstico copiado. Pégalo (Ctrl+V) en el mensaje de soporte."
+          : "No pude copiar el diagnóstico aquí. Ábrelo en Opciones → «Copiar diagnóstico».",
+        actions: ok ? [] : [{ id: "options", label: "Abrir Opciones" }],
+      });
     }
 
     return { show };
@@ -293,6 +324,7 @@
       return;
     }
     inputAt = Date.now();
+    reportInput();
     if (type === "pointerdown") pointerDown = true;
     else if (type === "pointerup" || type === "pointercancel") {
       pointerDown = false;
@@ -302,9 +334,22 @@
         setTimeout(run, 300);
       }
     }
-    if (inputAt - inputSentAt > 10000) {
-      inputSentAt = inputAt;
+  }
+  // Al background, como maximo una vez por segundo (y una ultima al terminar):
+  // asi distingue "otro programa mueve la ventana sin que hagas nada" de "algo
+  // reacciona a lo que haces en el visor".
+  let inputSendTimer = null;
+  function reportInput() {
+    const now = Date.now();
+    if (now - inputSentAt >= 1000) {
+      inputSentAt = now;
       send({ type: "pacs-dm:viewer-input" });
+    } else if (!inputSendTimer) {
+      inputSendTimer = setTimeout(() => {
+        inputSendTimer = null;
+        inputSentAt = Date.now();
+        send({ type: "pacs-dm:viewer-input" });
+      }, 1000 - (now - inputSentAt));
     }
   }
   if (inViewer) {
@@ -722,8 +767,13 @@
       setTimeout(fire, 300);
       scheduleReport(1500, true);
       // Con el boton, el usuario indica que algo se ve mal: se vuelve a
-      // revisar todo, aunque antes se hubiera aceptado.
-      if (manual) area.accepted.clear();
+      // revisar todo, aunque antes se hubiera aceptado o pausado.
+      if (manual) {
+        area.accepted.clear();
+        area.tries.clear();
+        area.streak = 0;
+        area.pausedUntil = 0;
+      }
     }
 
     // ---------------------------------------------------------------
@@ -736,7 +786,7 @@
     // boton. Si al reacomodar no cambia nada, ese es el layout que Synapse
     // quiere (p.ej. un panel abierto): se acepta y no se insiste.
     // ---------------------------------------------------------------
-    const area = { seenSig: "", seenAt: 0, verifying: false, accepted: new Set(), fixes: [], lastFixAt: 0, pausedUntil: 0 };
+    const area = { seenSig: "", seenAt: 0, verifying: false, accepted: new Map(), tries: new Map(), streak: 0, lastFixAt: 0, pausedUntil: 0 };
 
     function imageArea() {
       const vw = window.innerWidth;
@@ -829,7 +879,8 @@
       if (!u) return;
       const sig = sigOf(u);
       const problem = areaProblem(u);
-      if (!problem || area.accepted.has(sig)) {
+      const acceptedAt = area.accepted.get(sig);
+      if (!problem || (acceptedAt && now - acceptedAt < 180000)) {
         area.seenSig = "";
         return;
       }
@@ -840,13 +891,16 @@
         return;
       }
       if (now - area.seenAt < 1000 || now < area.pausedUntil || now - area.lastFixAt < 2000) return;
-      area.fixes = area.fixes.filter((t) => now - t < 60000);
-      if (area.fixes.length >= 6) {
-        area.pausedUntil = now + 120000;
+      // Solo es un "bucle" si vuelve a quedar mal sin que hayas usado el visor
+      // entre un reacomodo y otro; usandolo (cambiando imagenes) nunca se rinde.
+      if (inputAt > area.lastFixAt) area.streak = 0;
+      if (area.streak >= 6) {
+        area.streak = 0;
+        area.pausedUntil = now + 30000;
         send({ type: "pacs-dm:area-fix", result: "gave-up", from: u, problem });
         return;
       }
-      area.fixes.push(now);
+      area.streak++;
       area.lastFixAt = now;
       area.verifying = true;
       relayout("imagen");
@@ -856,15 +910,31 @@
         area.seenSig = "";
         const v = imageArea();
         if (v && !areaProblem(v)) {
+          area.tries.delete(sig);
           send({ type: "pacs-dm:area-fix", result: "fixed", from: u, to: v, problem });
-        } else if (v && sigOf(v) === sig && inputAt < now) {
-          // Quedo igual sin que tocaras nada: es el layout que Synapse quiere.
-          area.accepted.add(sig);
-          send({ type: "pacs-dm:area-fix", result: "accepted", from: u, problem });
+          return;
+        }
+        if (!v || sigOf(v) !== sig || inputAt >= now) return;
+        // Quedo igual sin que tocaras nada. Una imagen MAS CHICA puede ser a
+        // proposito (un panel abierto): tras 2 intentos se acepta un rato. Una
+        // imagen que se SALE de la ventana nunca se acepta.
+        if (problem.kind === "chica") {
+          const t = (area.tries.get(sig) || 0) + 1;
+          area.tries.set(sig, t);
+          if (t >= 2) {
+            area.tries.delete(sig);
+            area.accepted.set(sig, Date.now());
+            send({ type: "pacs-dm:area-fix", result: "accepted", from: u, problem });
+          }
         }
       }, 1500);
     }
     setInterval(checkArea, 1000);
+    // Cada 3 s el background confirma que la ventana sigue donde la dejo el
+    // boton (por si Chrome no aviso de algun cambio).
+    setInterval(() => {
+      if (document.visibilityState === "visible" && settings.keepInPlace) send({ type: "pacs-dm:viewer-tick" });
+    }, 3000);
 
     // Estado actual (para el diagnostico del boton): solo medidas.
     function layout() {

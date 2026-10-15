@@ -14,6 +14,7 @@
 //   layoutBug=restore: como Synapse real, tras su resizeTo acomoda la imagen
 //     para el tamano que PIDIO y solo la corrige con un evento resize;
 //     window.changeImage() lo repite (al cambiar imagenes).
+//   resizeLoop: en cada resize vuelve a pedir resizeTo (bucle).
 //   layoutBug=render: window.changeImage() deja la imagen 40 px fuera de la
 //     ventana (abajo) sin pedir cambio de tamano; window.togglePanel() abre un
 //     panel (imagen mas chica a proposito, tambien tras un resize).
@@ -128,6 +129,10 @@ const VIEWER = `<!doctype html><html><head><meta charset="utf-8"><title>Visor</t
     S.restoreAttempted = true;
     try { window.resizeTo(800, 600); window.moveTo(0, 0); } catch (e) {}
     if (bug === 'restore') setLayout(800, 600); // cree que la ventana quedo de 800x600
+  }
+  if (params.has('resizeLoop')) {
+    // Synapse "insiste": en cada resize vuelve a pedir su tamano.
+    addEventListener('resize', function () { S.loopCalls = (S.loopCalls || 0) + 1; try { window.resizeTo(800, 600); } catch (e) {} });
   }
   if (bug) {
     addEventListener('resize', fitLayout); // con un resize usa el tamano real
