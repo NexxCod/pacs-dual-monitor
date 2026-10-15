@@ -163,6 +163,20 @@ function windowChanges(s) {
   );
 }
 
+// Eventos resize sinteticos (los que manda la extension para que Synapse
+// reacomode la imagen).
+async function synthResizes(page) {
+  return page.evaluate(() => window.__viewer.resizes.filter((r) => !r.trusted).length);
+}
+
+// La imagen (canvas del visor simulado) ocupa exactamente la ventana.
+async function imageFits(page) {
+  return page.evaluate(() => {
+    const r = document.getElementById("vp").getBoundingClientRect();
+    return Math.abs(r.width - innerWidth) <= 1 && Math.abs(r.height - innerHeight) <= 1;
+  });
+}
+
 function near(a, b, tol = 3) {
   return (
     Math.abs(a.left - b.left) <= tol &&
@@ -376,14 +390,12 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 6000
     await swEval((id) => chrome.windows.update(id, { left: 60, top: 60, width: 900, height: 700 }), win.windowId);
     await waitFor(async () => near((await viewerWindow(page)).bounds, TARGET), { timeout: 3000, what: "restauración tras la guardia" });
     // Unos pocos px también se corrigen: ya cambian las mediciones.
+    const r0 = await synthResizes(page);
     await swEval((id) => chrome.windows.update(id, { top: 6, height: 1074 }), win.windowId);
     await waitFor(async () => /vuelve a su lugar \(vez n\.º 3\)/.test(await logText()), { timeout: 3000, what: "corrección de 6 px" });
     await waitFor(async () => near((await viewerWindow(page)).bounds, TARGET), { timeout: 3000, what: "restauración de 6 px" });
     // La imagen se reacomoda tras devolverla (como con el botón).
-    await waitFor(async () => (await page.evaluate(() => window.__viewer.resizes.some((r) => !r.trusted))), {
-      timeout: 3000,
-      what: "reacomodo del layout",
-    });
+    await waitFor(async () => (await synthResizes(page)) > r0, { timeout: 3000, what: "reacomodo del layout" });
     // Sin «mantener siempre», pasada la guardia se respeta lo que hagas.
     await setSettings({ guardSeconds: 3, keepInPlace: false });
     await swEval((id) => chrome.windows.update(id, { left: 70, top: 70, width: 900, height: 700 }), win.windowId);
@@ -820,11 +832,12 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 6000
   it("X) la página del visor se desplaza (scroll): vuelve a su lugar y se reacomoda; si algo la sigue desplazando se pausa", async () => {
     await worklist.evaluate(() => window.openStudy("X1", "popup", "tall=1"));
     const page = await waitViewer("X1");
-    await sleep(500);
+    await sleep(2000);
+    const r0 = await synthResizes(page);
     await page.evaluate(() => window.scrollTo(0, 150));
     assert.equal(await page.evaluate(() => window.scrollY), 150);
     await waitFor(async () => (await page.evaluate(() => window.scrollY)) === 0, { timeout: 3000, what: "scroll vuelve a 0" });
-    assert.ok(await page.evaluate(() => window.__viewer.resizes.some((r) => !r.trusted)), "se pidió reacomodar el layout");
+    assert.ok((await synthResizes(page)) > r0, "se pidió reacomodar el layout");
     await waitFor(async () => /La página del visor estaba desplazada \(0, 150 px\): vuelve a su lugar/.test(await logText()), {
       timeout: 3000,
       what: "registro del scroll",
@@ -862,6 +875,63 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 6000
     await patchDisplays(DISPLAYS);
     await swEval(() => scheduleDisplaysSettled());
     await waitFor(async () => near((await viewerWindow(page)).bounds, TARGET), { timeout: 6000, what: "reubicado al volver los externos" });
+  });
+
+  it("Z1) Synapse acomoda la imagen para el tamaño que pidió (resizeTo bloqueado): se le avisa el tamaño real, al abrir y al cambiar imágenes", async () => {
+    // Sin el vigilante del área de la imagen: esto lo resuelve el aviso del tamaño real.
+    await setSettings({ keepInPlace: false });
+    await worklist.evaluate(() => window.openStudy("Z1", "popup", "layoutBug=restore"));
+    const page = await waitViewer("Z1");
+    await waitFor(() => page.evaluate(() => window.__viewer.restoreAttempted), { what: "restaurar de Synapse" });
+    await waitFor(() => imageFits(page), { timeout: 3000, what: "imagen del tamaño de la ventana al abrir" });
+    // Cambiar imágenes: Synapse vuelve a "restaurar" y deja la imagen de 800x600...
+    await page.evaluate(() => window.changeImage());
+    assert.deepEqual(await page.evaluate(() => window.__viewer.layout), { w: 800, h: 600 }, "el visor simulado reproduce el problema");
+    // ...y en menos de 2 s vuelve sola al tamaño real (antes hacía falta el botón).
+    await waitFor(() => imageFits(page), { timeout: 2000, what: "imagen corregida tras cambiar imágenes" });
+    const log = await logText();
+    assert.match(log, /Synapse intentó resizeTo\(800, 600\) — bloqueado; se le avisa el tamaño real de la ventana/);
+    const win = await viewerWindow(page);
+    assert.ok(near(win.bounds, TARGET), "la ventana no se movió");
+    // El diagnóstico registra lo que Synapse intentó y lo que lee de la pantalla.
+    await page.evaluate(() => window.changeImage());
+    const rep = await swEval(async (tabId) => {
+      return chrome.tabs.sendMessage(tabId, { type: "pacs-dm:get-report" }, { frameId: 0 });
+    }, win.tabId);
+    assert.ok(rep.page && rep.page.calls.resizeTo >= 2 && rep.page.calls.moveTo >= 2, JSON.stringify(rep.page));
+    assert.ok("screen.availWidth" in rep.page.reads && "outerWidth" in rep.page.reads, "cuenta lecturas de medidas");
+  });
+
+  it("Z2) la imagen queda fuera de la ventana sin que Synapse pida nada: se reacomoda sola (nunca mientras usas el visor); un panel de Synapse se acepta", async () => {
+    await worklist.evaluate(() => window.openStudy("Z2", "popup", "layoutBug=render"));
+    const page = await waitViewer("Z2");
+    await sleep(2500); // que pase el "restaurar" de Synapse al cargar
+    await page.evaluate(() => window.changeImage()); // 40 px fuera, abajo
+    assert.equal(await imageFits(page), false);
+    await waitFor(() => imageFits(page), { timeout: 6000, what: "imagen reacomodada" });
+    await waitFor(async () => /La imagen del visor quedó fuera de la ventana \(abajo\)[^\n]*reacomodada/.test(await logText()), {
+      timeout: 3000,
+      what: "registro del reacomodo",
+    });
+    // Mientras arrastras/mides no se toca; al soltar, se reacomoda.
+    await page.mouse.move(700, 400);
+    await page.mouse.down();
+    await page.evaluate(() => window.changeImage());
+    await sleep(2500);
+    assert.equal(await imageFits(page), false, "no se toca mientras usas el visor");
+    await page.mouse.up();
+    await waitFor(() => imageFits(page), { timeout: 6000, what: "reacomodada al soltar" });
+    // Un panel (imagen más chica a propósito): un intento y se acepta, sin insistir.
+    await page.evaluate(() => window.togglePanel());
+    await waitFor(async () => /al reacomodarla no cambia: se deja así/.test(await logText()), { timeout: 8000, what: "panel aceptado" });
+    const n1 = await synthResizes(page);
+    await sleep(4000);
+    assert.equal(await synthResizes(page), n1, "no insiste con un layout que Synapse quiere así");
+    // Con el botón se vuelve a revisar todo (y se registra el antes/después).
+    await page.evaluate(() => window.togglePanel());
+    const r = await swEval(() => repositionViewerNow("prueba"));
+    assert.equal(r.ok, true);
+    await waitFor(async () => /Botón: cómo estaba el visor antes y cómo quedó/.test(await logText()), { timeout: 4000, what: "registro del botón" });
   });
 
   it("T) reinyección al instalar/actualizar con Synapse abierto: no duplica y reemplaza instancias desconectadas", async () => {

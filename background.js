@@ -9,7 +9,8 @@
 //    - la ventana se ubica en los dos monitores externos ANTES de que cargue
 //      el visor (desde la lanzadera o al empezar la navegacion), no despues;
 //    - se bloquea el "restaurar posicion" de Synapse (page-guard.js), que
-//      Chrome recorta a un solo monitor y achicaba la ventana a mitad de carga;
+//      Chrome recorta a un solo monitor y achicaba la ventana a mitad de carga,
+//      y se le avisa el tamano real para que acomode la imagen a la ventana;
 //    - el visor se mantiene SIEMPRE en su lugar (onBoundsChanged): si algo lo
 //      mueve, achica, maximiza o pone en pantalla completa, vuelve solo y se
 //      le pide a Synapse reacomodar la imagen (sin pelear sin fin con otro
@@ -871,7 +872,7 @@ async function restoreWindow(windowId) {
   const r = upsertManaged(rec.tabId, { lastRestoreAt: Date.now(), restores: (rec.restores || 0) + 1 });
   // Que Synapse reacomode la imagen al tamano correcto (igual que el boton).
   // (Si la vuelven a mover mientras tanto, applyBounds lo verifica al terminar.)
-  setTimeout(() => chrome.tabs.sendMessage(r.tabId, { type: "pacs-dm:relayout" }, { frameId: 0 }).catch(() => {}), 400);
+  setTimeout(() => chrome.tabs.sendMessage(r.tabId, { type: "pacs-dm:relayout", why: "ventana" }, { frameId: 0 }).catch(() => {}), 400);
 }
 
 async function verifyInPlace(windowId) {
@@ -1276,6 +1277,7 @@ async function onViewerHealth(tabId, msg) {
 
 async function onViewerReport(tabId, rep, sender) {
   if (!rep || !rep.now) return;
+  const prev = state.managed[tabId] && state.managed[tabId].report;
   const rec = upsertManaged(tabId, {
     windowId: sender.tab.windowId,
     reportAt: Date.now(),
@@ -1287,6 +1289,9 @@ async function onViewerReport(tabId, rep, sender) {
       media: rep.media,
       blockedCalls: rep.blockedCalls,
       hasInput: rep.hasInput,
+      area: rep.area,
+      relayouts: rep.relayouts,
+      page: rep.page,
     },
   });
   const zoom = await chrome.tabs.getZoom(tabId).catch(() => 1);
@@ -1320,16 +1325,19 @@ async function onViewerReport(tabId, rep, sender) {
   // deformada tras 2 intentos seguidos, se avisa.
   const distorted = rep.media && rep.media.distorted > 0;
   const now = Date.now();
+  // Solo si el tamano cambio desde el informe anterior (no "alguna vez").
+  const resized =
+    rep.sizeChangedAfterDcl && (!prev || !prev.size || prev.size[0] !== rep.now.iw || prev.size[1] !== rep.now.ih);
   if (distorted && (rec.distortedTries || 0) >= 2) {
     noticeTab(tabId, "warn", "La imagen del visor se ve deformada (no se ajustó al tamaño de la ventana). Recarga el visor antes de medir.", {
       sticky: true,
       key: "distorted",
       actions: [{ id: "reload", label: "Recargar visor" }],
     });
-  } else if ((rep.sizeChangedAfterDcl || distorted) && now - (rec.lastRelayoutAt || 0) > 3000) {
+  } else if ((resized || distorted) && now - (rec.lastRelayoutAt || 0) > 3000) {
     upsertManaged(tabId, { lastRelayoutAt: now, distortedTries: distorted ? (rec.distortedTries || 0) + 1 : 0 });
     log("info", distorted ? "Imagen deformada en el visor: pidiendo a Synapse que recalcule el layout." : "El visor cambió de tamaño: pidiendo a Synapse que reacomode la imagen.");
-    chrome.tabs.sendMessage(tabId, { type: "pacs-dm:relayout" }, { frameId: 0 }).catch(() => {});
+    chrome.tabs.sendMessage(tabId, { type: "pacs-dm:relayout", why: distorted ? "deformada" : "tamano" }, { frameId: 0 }).catch(() => {});
   } else if (!distorted && rec.distortedTries) {
     upsertManaged(tabId, { distortedTries: 0 });
   }
@@ -1340,14 +1348,21 @@ async function onViewerReport(tabId, rep, sender) {
   }
 }
 
+// Como quedo la imagen de Synapse respecto de la ventana (para el registro).
+function describeArea(p) {
+  if (!p) return "fuera de lugar";
+  if (p.kind === "chica") return "más chica que la ventana";
+  return `fuera de la ventana (${(p.sides || []).join(", ")})`;
+}
+
 // =====================================================================
 // Bordes: que el area del visor calce exacto con la pantalla
 // =====================================================================
 // El content script mide con el mouse (screenX - clientX) donde quedo de
 // verdad el area de la pagina del visor en la pantalla. Si se pasa del area
-// visible (p.ej. hacia abajo, debajo del borde de la pantalla) o deja un
-// hueco, se corrigen los bordes, se guardan para los proximos estudios y, si
-// aun no usaste el visor, se ajusta de inmediato.
+// visible (p.ej. hacia abajo, debajo del borde de la pantalla), se achican
+// los bordes, se guardan para los proximos estudios y, si aun no usaste el
+// visor, se ajusta de inmediato (una vez por estudio).
 function describeOver(over) {
   const parts = [];
   if (over.bottom > 0) parts.push(`${over.bottom} px hacia abajo`);
@@ -1448,6 +1463,10 @@ async function repositionViewerNow(source, preferTabId) {
     return { ok: false, reason: "no-displays" };
   }
   log("info", `Reubicación manual del visor (${source}).`);
+  // Diagnostico: como estaba todo justo antes de apretar el boton (si el
+  // boton "arregla" algo, aqui queda registrado que era).
+  const before = await withTimeout(chrome.tabs.sendMessage(tab.id, { type: "pacs-dm:get-layout" }, { frameId: 0 }).catch(() => null), 800);
+  const winBefore = box(await chrome.windows.get(tab.windowId).catch(() => null));
   const res = await placeTab(tab, target, `manual (${source})`, {
     role: "viewer",
     guardUntil: Date.now() + settings.guardSeconds * 1000,
@@ -1457,7 +1476,23 @@ async function repositionViewerNow(source, preferTabId) {
     userMovedAt: 0,
   });
   await ensureZoom100(tab.id, "manual");
-  chrome.tabs.sendMessage(tab.id, { type: "pacs-dm:relayout" }, { frameId: 0 }).catch(() => {});
+  chrome.tabs.sendMessage(tab.id, { type: "pacs-dm:relayout", manual: true }, { frameId: 0 }).catch(() => {});
+  setTimeout(
+    () =>
+      track(
+        (async () => {
+          const after = await withTimeout(chrome.tabs.sendMessage(tab.id, { type: "pacs-dm:get-layout" }, { frameId: 0 }).catch(() => null), 800);
+          const cur = await getTab(tab.id);
+          const winAfter = cur ? box(await chrome.windows.get(cur.windowId).catch(() => null)) : null;
+          log("info", "Botón: cómo estaba el visor antes y cómo quedó.", {
+            ventana: { antes: winBefore, despues: winAfter, destino: target.bounds },
+            antes: before,
+            despues: after,
+          });
+        })()
+      ),
+    1500
+  );
   noticeTab(
     tab.id,
     res.ok ? "info" : "warn",
@@ -1483,6 +1518,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 const pageEventCount = new Map();
+const windowCallCount = new Map();
 
 async function handleMessage(msg, sender) {
   await ready;
@@ -1550,6 +1586,29 @@ async function handleMessage(msg, sender) {
     case "pacs-dm:viewer-input":
       if (tabId != null && state.managed[tabId]) upsertManaged(tabId, { inputAt: Date.now() });
       return;
+    case "pacs-dm:area-fix": {
+      // La imagen de Synapse quedo fuera de la ventana (o mucho mas chica).
+      if (tabId == null || !state.managed[tabId]) return;
+      const rec = state.managed[tabId];
+      const what = describeArea(msg.problem);
+      const from = msg.from ? `${msg.from.l},${msg.from.t} → ${msg.from.r},${msg.from.b} en ${msg.from.vw}×${msg.from.vh}` : "";
+      if (msg.result === "fixed") {
+        const n = (rec.areaFixes || 0) + 1;
+        upsertManaged(tabId, { areaFixes: n, lastAreaFix: { at: Date.now(), from: msg.from, to: msg.to } });
+        if (n <= 10 || n % 10 === 0) log("info", `La imagen del visor quedó ${what} (${from}): reacomodada, como con el botón (vez n.º ${n}).`);
+      } else if (msg.result === "accepted") {
+        log("info", `La imagen del visor quedó ${what} (${from}) y al reacomodarla no cambia: se deja así (puede ser un panel de Synapse).`);
+      } else if (msg.result === "gave-up") {
+        log("warn", `La imagen del visor sigue quedando ${what} (${from}): dejo de reacomodarla por 2 minutos.`);
+        warnOnce(
+          `area:${tabId}`,
+          tabId,
+          "warn",
+          "Synapse sigue dejando la imagen fuera de la ventana. Usa el botón de la extensión (Ctrl+Shift+Y) y envía «Copiar diagnóstico» desde Opciones."
+        );
+      }
+      return;
+    }
     case "pacs-dm:scroll-fix": {
       // La pagina del visor se habia desplazado (toda la imagen corrida).
       if (tabId == null || !state.managed[tabId]) return;
@@ -1574,10 +1633,24 @@ async function handleMessage(msg, sender) {
           key: "zoom-alert",
           actions: [{ id: "reload", label: "Recargar visor" }],
         });
+      } else if (ev.type === "window-call") {
+        // Synapse intenta mover/achicar la ventana (p.ej. al abrir un estudio o
+        // cambiar imagenes): bloqueado, y se le avisa el tamano real.
+        const c = (windowCallCount.get(tabId) || 0) + 1;
+        windowCallCount.set(tabId, c);
+        if (c <= 20 || c % 20 === 0) {
+          const since = ev.sinceInput != null && ev.sinceInput < 60000 ? `, ${Math.round(ev.sinceInput / 100) / 10} s después de usar el visor` : "";
+          log(
+            "info",
+            `Synapse intentó ${ev.name}(${(ev.args || []).join(", ")})` +
+              (ev.blocked ? " — bloqueado; se le avisa el tamaño real de la ventana" : "") +
+              ` (n.º ${c}${since}).`
+          );
+        }
+      } else if (ev.type === "resync-paused") {
+        log("warn", "Synapse vuelve a pedir otro tamaño cada vez que se le avisa el real: se deja de avisar por 1 minuto.");
       } else if (n <= 15) {
-        if (ev.type === "window-call") {
-          log("info", `Synapse intentó ${ev.name}(${(ev.args || []).join(", ")})${ev.blocked ? " — bloqueado" : ""}`);
-        } else if (ev.type === "fullscreen") {
+        if (ev.type === "fullscreen") {
           log("info", `Synapse pidió pantalla completa${ev.blocked ? " — bloqueado (dejaría el visor en un solo monitor)" : ""}.`);
         } else if (ev.type === "dialog") {
           // El texto de otros alert() podria traer datos del paciente: no se guarda.

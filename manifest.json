@@ -3,7 +3,7 @@
   "name": "PACS Dual Monitor",
   "short_name": "PACS Dual Monitor",
   "description": "Abre el visor de Synapse ya ubicado en los dos monitores externos, con zoom y escala correctos para medir, y verifica que el estudio realmente abra (sin pantalla negra).",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "minimum_chrome_version": "111",
   "author": "Marcelo Salinas Villagra",
   "permissions": [

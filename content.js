@@ -12,7 +12,9 @@
 //   pueden quedar mal y el background decide recargar o avisar. Detecta
 //   pantalla negra por perdida del contexto grafico (WebGL), imagenes
 //   deformadas y errores HTTP. Bloquea el zoom accidental del navegador.
-//   Si la pagina del visor queda desplazada (scroll), la devuelve a su lugar.
+//   Si la pagina del visor queda desplazada (scroll), la devuelve a su lugar,
+//   y si Synapse deja la imagen fuera de la ventana (o mucho mas chica) con
+//   el visor quieto, le pide reacomodarla, como el boton de la extension.
 // - Muestra los avisos de la extension (esquina inferior izquierda).
 
 (() => {
@@ -270,11 +272,36 @@
   const inViewer = TOP_VIEWER;
   let inputAt = 0;
   let inputSentAt = 0;
+  let moveAt = 0; // ultimo movimiento del mouse sobre el visor
+  let pointerDown = false; // boton del mouse apretado (arrastrando, midiendo...)
+  let afterPointerUp = null; // reacomodo pendiente hasta soltar el mouse
   // Cualquier uso del visor (tambien dentro de iframes) se informa al
   // background: con el visor en uso nunca se recarga solo, solo se avisa.
   function markInput(e) {
     if (!e.isTrusted) return;
+    noteInput(e.type);
+    // El uso dentro de un iframe tambien cuenta para la pagina principal.
+    if (!isTop) {
+      try {
+        window.top.dispatchEvent(new CustomEvent("pacs-dm:frame-input", { detail: e.type }));
+      } catch (err) { /* iframe de otro origen */ }
+    }
+  }
+  function noteInput(type) {
+    if (type === "pointermove") {
+      moveAt = Date.now(); // mover el mouse no es "usar" el visor
+      return;
+    }
     inputAt = Date.now();
+    if (type === "pointerdown") pointerDown = true;
+    else if (type === "pointerup" || type === "pointercancel") {
+      pointerDown = false;
+      if (afterPointerUp) {
+        const run = afterPointerUp;
+        afterPointerUp = null;
+        setTimeout(run, 300);
+      }
+    }
     if (inputAt - inputSentAt > 10000) {
       inputSentAt = inputAt;
       send({ type: "pacs-dm:viewer-input" });
@@ -303,7 +330,29 @@
       },
       true
     );
-    window.addEventListener("pointerdown", markInput, { capture: true, passive: true });
+    for (const type of ["pointerdown", "pointerup", "pointercancel"]) {
+      window.addEventListener(type, markInput, { capture: true, passive: true });
+    }
+    let moveSentAt = 0;
+    window.addEventListener(
+      "pointermove",
+      (e) => {
+        if (!e.isTrusted) return;
+        // Boton soltado sin que llegara "pointerup" (p.ej. fuera de la ventana).
+        if (pointerDown && e.buttons === 0) markInput({ isTrusted: true, type: "pointerup" });
+        const now = Date.now();
+        if (now - moveSentAt < 200) return;
+        moveSentAt = now;
+        markInput({ isTrusted: true, type: "pointermove" });
+      },
+      { capture: true, passive: true }
+    );
+    if (isTop) {
+      window.addEventListener("pacs-dm:frame-input", (e) => noteInput(String(e.detail)));
+      window.addEventListener("blur", () => {
+        if (pointerDown) noteInput("pointercancel");
+      });
+    }
     window.addEventListener("mousemove", measureViewport, { capture: true, passive: true });
     watchWebgl();
   }
@@ -399,6 +448,23 @@
       },
       true
     );
+  }
+
+  // Estadisticas del page-guard (mundo MAIN) para el diagnostico: llamadas
+  // bloqueadas, avisos de tamano real y que medidas de pantalla lee Synapse.
+  let pageStats = null;
+  if (isTop && IS_VIEWER) {
+    window.addEventListener("pacs-dm:stats", (e) => {
+      try {
+        pageStats = JSON.parse(e.detail);
+      } catch (err) { /* nada */ }
+    });
+  }
+  function readPageStats() {
+    try {
+      window.dispatchEvent(new CustomEvent("pacs-dm:stats-request")); // responde en el acto
+    } catch (e) { /* nada */ }
+    return pageStats;
   }
 
   // ===================================================================
@@ -497,7 +563,7 @@
         return;
       }
       scrollFixes.push(now);
-      relayout();
+      relayout("scroll");
       setTimeout(() => {
         if (window.scrollX || window.scrollY) window.scrollTo({ left: 0, top: 0, behavior: "instant" });
         send({ type: "pacs-dm:scroll-fix", from });
@@ -620,6 +686,9 @@
         hasInput: inputAt > 0,
         blockedCalls,
         media: mediaInfo(),
+        area: imageArea(),
+        relayouts,
+        page: readPageStats(),
         visibility: document.visibilityState,
       };
     }
@@ -632,7 +701,17 @@
       }, ms);
     }
 
-    function relayout() {
+    // Reacomodos pedidos, por motivo (para el diagnostico).
+    const relayouts = {};
+    function relayout(why) {
+      why = why || "extension";
+      const manual = why === "boton";
+      // Nunca a mitad de un arrastre o una medicion: se hace al soltar.
+      if (!manual && pointerDown) {
+        afterPointerUp = () => relayout(why);
+        return;
+      }
+      relayouts[why] = (relayouts[why] || 0) + 1;
       // Pide a Synapse recalcular su layout con el tamano actual.
       const fire = () => {
         try {
@@ -642,11 +721,166 @@
       fire();
       setTimeout(fire, 300);
       scheduleReport(1500, true);
+      // Con el boton, el usuario indica que algo se ve mal: se vuelve a
+      // revisar todo, aunque antes se hubiera aceptado.
+      if (manual) area.accepted.clear();
+    }
+
+    // ---------------------------------------------------------------
+    // La imagen dentro de la ventana. Synapse a veces acomoda sus visores
+    // para un tamano que no es el de la ventana (p.ej. el que "recuerda") y
+    // la imagen queda saliendose de la pantalla o mucho mas chica; el boton
+    // de la extension lo arregla porque le avisa el tamano real ("resize").
+    // Aqui se vigila el area que ocupan las imagenes y, si queda fuera de la
+    // ventana (o mucho mas chica) con el visor quieto, se hace lo mismo que el
+    // boton. Si al reacomodar no cambia nada, ese es el layout que Synapse
+    // quiere (p.ej. un panel abierto): se acepta y no se insiste.
+    // ---------------------------------------------------------------
+    const area = { seenSig: "", seenAt: 0, verifying: false, accepted: new Set(), fixes: [], lastFixAt: 0, pausedUntil: 0 };
+
+    function imageArea() {
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      if (!vw || !vh) return null;
+      const minArea = 0.01 * vw * vh;
+      const close = (a, b) => Math.abs(a - b) <= 2;
+      // Contenedores del tamano de la ventana (html, body, raiz de la app):
+      // que recorten en el borde de la ventana es justamente el problema.
+      const windowSized = (b) => close(b.l, 0) && close(b.t, 0) && close(b.r, vw) && close(b.b, vh);
+      const cut = (b, c) => {
+        const r = { l: Math.max(b.l, c.l), t: Math.max(b.t, c.t), r: Math.min(b.r, c.r), b: Math.min(b.b, c.b) };
+        return r.r - r.l < 2 || r.b - r.t < 2 ? null : r;
+      };
+      let u = null;
+      let n = 0;
+      const scan = (doc, offX, offY, clip, depth) => {
+        const view = doc.defaultView;
+        for (const el of doc.querySelectorAll("canvas, img, video")) {
+          const r = el.getBoundingClientRect();
+          if (r.width * r.height < minArea) continue;
+          const cs = view.getComputedStyle(el);
+          if (cs.visibility === "hidden" || cs.display === "none" || Number(cs.opacity) === 0) continue;
+          let b = { l: r.left + offX, t: r.top + offY, r: r.right + offX, b: r.bottom + offY };
+          if (clip) b = cut(b, clip);
+          for (let a = el.parentElement; a && b && a !== doc.body && a !== doc.documentElement; a = a.parentElement) {
+            const acs = view.getComputedStyle(a);
+            const ox = acs.overflowX !== "visible";
+            const oy = acs.overflowY !== "visible";
+            if (!ox && !oy) continue;
+            const ar = a.getBoundingClientRect();
+            const A = { l: ar.left + offX, t: ar.top + offY, r: ar.right + offX, b: ar.bottom + offY };
+            if (windowSized(A)) continue;
+            b = cut(b, { l: ox ? A.l : -Infinity, t: oy ? A.t : -Infinity, r: ox ? A.r : Infinity, b: oy ? A.b : Infinity });
+          }
+          if (!b) continue;
+          n++;
+          u = u ? { l: Math.min(u.l, b.l), t: Math.min(u.t, b.t), r: Math.max(u.r, b.r), b: Math.max(u.b, b.b) } : b;
+        }
+        if (depth > 3) return;
+        for (const f of doc.querySelectorAll("iframe")) {
+          let inner = null;
+          try {
+            inner = f.contentDocument;
+          } catch (e) { /* otro origen */ }
+          if (!inner) continue;
+          const fr = f.getBoundingClientRect();
+          const fcs = view.getComputedStyle(f);
+          const F = { l: fr.left + offX, t: fr.top + offY, r: fr.right + offX, b: fr.bottom + offY };
+          const c = windowSized(F) ? clip : clip ? cut(F, clip) : F;
+          if (clip && !c) continue;
+          scan(
+            inner,
+            F.l + (parseFloat(fcs.borderLeftWidth) || 0) + (parseFloat(fcs.paddingLeft) || 0),
+            F.t + (parseFloat(fcs.borderTopWidth) || 0) + (parseFloat(fcs.paddingTop) || 0),
+            c,
+            depth + 1
+          );
+        }
+      };
+      try {
+        scan(document, 0, 0, null, 0);
+      } catch (e) {
+        return null;
+      }
+      if (!u) return null;
+      return { l: Math.round(u.l), t: Math.round(u.t), r: Math.round(u.r), b: Math.round(u.b), n, vw, vh };
+    }
+
+    function areaProblem(u) {
+      const sides = [];
+      if (u.l < -2) sides.push("izquierda");
+      if (u.t < -2) sides.push("arriba");
+      if (u.r > u.vw + 2) sides.push("derecha");
+      if (u.b > u.vh + 2) sides.push("abajo");
+      if (sides.length) return { kind: "fuera", sides };
+      if (u.r < 0.75 * u.vw || u.b < 0.75 * u.vh) return { kind: "chica" };
+      return null;
+    }
+
+    const sigOf = (u) => [u.l, u.t, u.r, u.b, u.vw, u.vh].join(",");
+
+    function checkArea() {
+      if (!settings.keepInPlace || document.visibilityState !== "visible" || area.verifying) return;
+      const now = Date.now();
+      // Nunca mientras usas el visor (arrastrando, midiendo, recorriendo) ni
+      // mientras mueves el mouse (p.ej. una vista previa que sigue al puntero).
+      if (pointerDown || now - inputAt < 1000 || now - moveAt < 1000) return;
+      const u = imageArea();
+      if (!u) return;
+      const sig = sigOf(u);
+      const problem = areaProblem(u);
+      if (!problem || area.accepted.has(sig)) {
+        area.seenSig = "";
+        return;
+      }
+      // Que se quede asi al menos 1 s (Synapse puede estar acomodando).
+      if (sig !== area.seenSig) {
+        area.seenSig = sig;
+        area.seenAt = now;
+        return;
+      }
+      if (now - area.seenAt < 1000 || now < area.pausedUntil || now - area.lastFixAt < 2000) return;
+      area.fixes = area.fixes.filter((t) => now - t < 60000);
+      if (area.fixes.length >= 6) {
+        area.pausedUntil = now + 120000;
+        send({ type: "pacs-dm:area-fix", result: "gave-up", from: u, problem });
+        return;
+      }
+      area.fixes.push(now);
+      area.lastFixAt = now;
+      area.verifying = true;
+      relayout("imagen");
+      // Resultado del reacomodo, medido en el momento.
+      setTimeout(() => {
+        area.verifying = false;
+        area.seenSig = "";
+        const v = imageArea();
+        if (v && !areaProblem(v)) {
+          send({ type: "pacs-dm:area-fix", result: "fixed", from: u, to: v, problem });
+        } else if (v && sigOf(v) === sig && inputAt < now) {
+          // Quedo igual sin que tocaras nada: es el layout que Synapse quiere.
+          area.accepted.add(sig);
+          send({ type: "pacs-dm:area-fix", result: "accepted", from: u, problem });
+        }
+      }, 1500);
+    }
+    setInterval(checkArea, 1000);
+
+    // Estado actual (para el diagnostico del boton): solo medidas.
+    function layout() {
+      const u = imageArea();
+      return {
+        ventana: { x: window.screenX, y: window.screenY, w: window.outerWidth, h: window.outerHeight },
+        pagina: { w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio, scroll: [window.scrollX, window.scrollY] },
+        imagen: u,
+        problema: u ? areaProblem(u) : null,
+      };
     }
 
     return {
       relayout,
       report,
+      layout,
       onBlockedCall() {
         blockedCalls++;
       },
@@ -669,6 +903,7 @@
         return;
       }
       if (data.type === "window-call" && data.blocked && viewer) viewer.onBlockedCall();
+      data.sinceInput = inputAt ? Date.now() - inputAt : null;
       send({ type: "pacs-dm:page-event", event: data });
     });
   }
@@ -691,8 +926,11 @@
           sendResponse(viewer ? viewer.report() : null);
           return;
         case "pacs-dm:relayout":
-          if (viewer) viewer.relayout();
+          if (viewer) viewer.relayout(msg.manual ? "boton" : String(msg.why || "extension"));
           sendResponse({ ok: true });
+          return;
+        case "pacs-dm:get-layout":
+          sendResponse(viewer ? viewer.layout() : null);
           return;
         default:
           return;

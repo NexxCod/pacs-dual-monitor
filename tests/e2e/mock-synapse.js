@@ -10,7 +10,13 @@
 //                           latido del candado, recibe estudios, "restaura"
 //                           su posicion con resizeTo/moveTo tras cargar.
 //   flags: zombie (no recibe estudios), webgl (canvas WebGL), goodResize,
-//   tall (pagina desplazable), iframe, selfWarn, status.
+//   tall (pagina desplazable), iframe, selfWarn, status,
+//   layoutBug=restore: como Synapse real, tras su resizeTo acomoda la imagen
+//     para el tamano que PIDIO y solo la corrige con un evento resize;
+//     window.changeImage() lo repite (al cambiar imagenes).
+//   layoutBug=render: window.changeImage() deja la imagen 40 px fuera de la
+//     ventana (abajo) sin pedir cambio de tamano; window.togglePanel() abre un
+//     panel (imagen mas chica a proposito, tambien tras un resize).
 // - /img                    datos de imagen (20 KB).
 
 const https = require("node:https");
@@ -110,6 +116,27 @@ const VIEWER = `<!doctype html><html><head><meta charset="utf-8"><title>Visor</t
     S.resizes.push({ t: Date.now() - S.t0, w: innerWidth, h: innerHeight, ow: outerWidth, oh: outerHeight, sx: screenX, sy: screenY, dpr: devicePixelRatio, trusted: e.isTrusted });
     if (params.has('goodResize')) { c.width = Math.round(innerWidth * devicePixelRatio); c.height = Math.round(innerHeight * devicePixelRatio); draw(); }
   });
+  var bug = params.get('layoutBug');
+  S.panel = false;
+  function setLayout(w, h) {
+    S.layout = { w: w, h: h };
+    c.style.width = w + 'px'; c.style.height = h + 'px';
+    c.width = w; c.height = h; draw();
+  }
+  function fitLayout() { setLayout(S.panel ? Math.round(innerWidth * 0.6) : innerWidth, innerHeight); }
+  function restoreGeometry() {
+    S.restoreAttempted = true;
+    try { window.resizeTo(800, 600); window.moveTo(0, 0); } catch (e) {}
+    if (bug === 'restore') setLayout(800, 600); // cree que la ventana quedo de 800x600
+  }
+  if (bug) {
+    addEventListener('resize', fitLayout); // con un resize usa el tamano real
+    window.changeImage = function () {
+      if (bug === 'restore') restoreGeometry();
+      else setLayout(innerWidth, innerHeight + 40);
+    };
+    window.togglePanel = function () { S.panel = !S.panel; fitLayout(); };
+  }
   if (params.has('tall')) {
     // Contenido mas alto que la ventana: la pagina se puede desplazar.
     var tall = document.createElement('div');
@@ -133,7 +160,7 @@ const VIEWER = `<!doctype html><html><head><meta charset="utf-8"><title>Visor</t
   addEventListener('load', function () {
     S.loaded = Date.now() - S.t0;
     // Synapse "restaura" el tamano/posicion guardados del visor.
-    setTimeout(function () { S.restoreAttempted = true; try { window.resizeTo(800, 600); window.moveTo(0, 0); } catch (e) {} }, 300);
+    setTimeout(restoreGeometry, 300);
   });
 })();
 </script></body></html>`;
