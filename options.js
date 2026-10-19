@@ -132,7 +132,7 @@
         rep.blockedCalls ? h("div", { class: "muted" }, `Intentos de Synapse de mover la ventana bloqueados: ${rep.blockedCalls}`) : null,
         m.restores ? h("div", { class: "muted" }, `Ventana devuelta a su lugar automáticamente: ${m.restores} ${m.restores === 1 ? "vez" : "veces"}`) : null,
         m.scrollFixes ? h("div", { class: "muted" }, `Página del visor devuelta a su lugar (desplazada): ${m.scrollFixes} ${m.scrollFixes === 1 ? "vez" : "veces"}`) : null,
-        m.areaFixes ? h("div", { class: "muted" }, `Imagen reacomodada automáticamente (había quedado fuera de la ventana): ${m.areaFixes} ${m.areaFixes === 1 ? "vez" : "veces"}`) : null,
+        m.areaFixes ? h("div", { class: "muted" }, `Imágenes reacomodadas automáticamente (Synapse las dejó con otro tamaño): ${m.areaFixes} ${m.areaFixes === 1 ? "vez" : "veces"}`) : null,
         rep.page && rep.page.resyncs
           ? h("div", { class: "muted" }, `Avisos a Synapse del tamaño real de la ventana: ${rep.page.resyncs}`)
           : null,

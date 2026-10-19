@@ -1380,7 +1380,8 @@ function describeButtonFix(winBefore, winAfter, before, after, zoomBefore) {
   const ib = before && before.imagen;
   const ia = after && after.imagen;
   const a = (u) => `${u.l},${u.t} → ${u.r},${u.b}`;
-  if (ib && ia && (ib.l !== ia.l || ib.t !== ia.t || ib.r !== ia.r || ib.b !== ia.b)) parts.push(`la imagen ocupaba ${a(ib)} y quedó ${a(ia)}`);
+  if (ib && ia && (ib.l !== ia.l || ib.t !== ia.t || ib.r !== ia.r || ib.b !== ia.b)) parts.push(`las imágenes ocupaban ${a(ib)} y quedaron en ${a(ia)}`);
+  else if (ib && ia && ib.firma !== ia.firma) parts.push("algunas imágenes tenían otro tamaño o posición");
   else if (before && before.problema) parts.push(`la imagen estaba ${describeArea(before.problema)}`);
   return parts;
 }
@@ -1655,25 +1656,22 @@ async function handleMessage(msg, sender) {
     case "pacs-dm:diagnostic":
       return buildDiagnostic();
     case "pacs-dm:area-fix": {
-      // La imagen de Synapse quedo fuera de la ventana (o mucho mas chica).
+      // Synapse acomodo las imagenes con un tamano equivocado y el aviso de
+      // tamano real (como el boton) las corrigio.
       if (tabId == null || !state.managed[tabId]) return;
       const rec = state.managed[tabId];
-      const what = describeArea(msg.problem);
-      const from = msg.from ? `${msg.from.l},${msg.from.t} → ${msg.from.r},${msg.from.b} en ${msg.from.vw}×${msg.from.vh}` : "";
+      const a = (u) => (u ? `${u.l},${u.t} → ${u.r},${u.b}` : "?");
       if (msg.result === "fixed") {
         const n = (rec.areaFixes || 0) + 1;
         upsertManaged(tabId, { areaFixes: n, lastAreaFix: { at: Date.now(), from: msg.from, to: msg.to } });
-        if (n <= 10 || n % 10 === 0) log("info", `La imagen del visor quedó ${what} (${from}): reacomodada, como con el botón (vez n.º ${n}).`);
-      } else if (msg.result === "accepted") {
-        log("info", `La imagen del visor quedó ${what} (${from}) y al reacomodarla no cambia: se deja así (puede ser un panel de Synapse).`);
+        if (n <= 10 || n % 10 === 0) {
+          log("info", `Synapse acomodó las imágenes con otro tamaño (${a(msg.from)}); reacomodadas como con el botón (${a(msg.to)}) (vez n.º ${n}).`, {
+            antes: msg.from,
+            despues: msg.to,
+          });
+        }
       } else if (msg.result === "gave-up") {
-        log("warn", `La imagen del visor sigue quedando ${what} (${from}): dejo de reacomodarla por 2 minutos.`);
-        warnOnce(
-          `area:${tabId}`,
-          tabId,
-          "warn",
-          "Synapse sigue dejando la imagen fuera de la ventana. Usa el botón de la extensión (Ctrl+Shift+Y) y envía «Copiar diagnóstico» desde Opciones."
-        );
+        log("warn", `Las imágenes cambian de tamaño solas una y otra vez sin que uses el visor (${a(msg.from)}): dejo de reacomodarlas por 15 s.`);
       }
       return;
     }

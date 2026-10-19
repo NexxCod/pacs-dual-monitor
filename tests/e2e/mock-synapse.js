@@ -15,6 +15,10 @@
 //     para el tamano que PIDIO y solo la corrige con un evento resize;
 //     window.changeImage() lo repite (al cambiar imagenes).
 //   resizeLoop: en cada resize vuelve a pedir resizeTo (bucle).
+//   layoutBug=short: window.changeImage() deja la imagen 10 px mas corta
+//     (como el Synapse real al poner una imagen nueva); un resize la corrige.
+//   layoutBug=inner: hay un segundo visor (40% x 40%) y changeImage() lo deja
+//     10 px mas corto sin cambiar el contorno total de las imagenes.
 //   layoutBug=render: window.changeImage() deja la imagen 40 px fuera de la
 //     ventana (abajo) sin pedir cambio de tamano; window.togglePanel() abre un
 //     panel (imagen mas chica a proposito, tambien tras un resize).
@@ -124,7 +128,18 @@ const VIEWER = `<!doctype html><html><head><meta charset="utf-8"><title>Visor</t
     c.style.width = w + 'px'; c.style.height = h + 'px';
     c.width = w; c.height = h; draw();
   }
-  function fitLayout() { setLayout(S.panel ? Math.round(innerWidth * 0.6) : innerWidth, innerHeight); }
+  var vp2 = null;
+  if (bug === 'inner') {
+    vp2 = document.createElement('canvas'); vp2.id = 'vp2';
+    vp2.style.cssText = 'position:absolute;left:0;top:0';
+    document.body.appendChild(vp2);
+  }
+  function setVp2(w, h) { if (!vp2) return; vp2.style.width = w + 'px'; vp2.style.height = h + 'px'; vp2.width = w; vp2.height = h; S.vp2 = { w: w, h: h }; }
+  function fitLayout() {
+    setLayout(S.panel ? Math.round(innerWidth * 0.6) : innerWidth, innerHeight);
+    setVp2(Math.round(innerWidth * 0.4), Math.round(innerHeight * 0.4));
+  }
+  if (vp2) document.addEventListener('DOMContentLoaded', fitLayout);
   function restoreGeometry() {
     S.restoreAttempted = true;
     try { window.resizeTo(800, 600); window.moveTo(0, 0); } catch (e) {}
@@ -138,6 +153,8 @@ const VIEWER = `<!doctype html><html><head><meta charset="utf-8"><title>Visor</t
     addEventListener('resize', fitLayout); // con un resize usa el tamano real
     window.changeImage = function () {
       if (bug === 'restore') restoreGeometry();
+      else if (bug === 'short') setLayout(innerWidth, innerHeight - 10);
+      else if (bug === 'inner') setVp2(Math.round(innerWidth * 0.4), Math.round(innerHeight * 0.4) - 10);
       else setLayout(innerWidth, innerHeight + 40);
     };
     window.togglePanel = function () { S.panel = !S.panel; fitLayout(); };

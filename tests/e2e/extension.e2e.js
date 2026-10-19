@@ -902,14 +902,14 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 6000
     assert.ok("screen.availWidth" in rep.page.reads && "outerWidth" in rep.page.reads, "cuenta lecturas de medidas");
   });
 
-  it("Z2) la imagen queda fuera de la ventana sin que Synapse pida nada: se reacomoda sola (nunca mientras usas el visor); un panel de Synapse se acepta", async () => {
+  it("Z2) Synapse acomoda mal las imágenes sin pedir nada: se reacomodan solas como con el botón (no mientras arrastras); un panel no se toca", async () => {
     await worklist.evaluate(() => window.openStudy("Z2", "popup", "layoutBug=render"));
     const page = await waitViewer("Z2");
     await sleep(2500); // que pase el "restaurar" de Synapse al cargar
     await page.evaluate(() => window.changeImage()); // 40 px fuera, abajo
     assert.equal(await imageFits(page), false);
-    await waitFor(() => imageFits(page), { timeout: 6000, what: "imagen reacomodada" });
-    await waitFor(async () => /La imagen del visor quedó fuera de la ventana \(abajo\)[^\n]*reacomodada/.test(await logText()), {
+    await waitFor(() => imageFits(page), { timeout: 3000, what: "imagen reacomodada" });
+    await waitFor(async () => /Synapse acomodó las imágenes con otro tamaño[^\n]*reacomodadas como con el botón/.test(await logText()), {
       timeout: 3000,
       what: "registro del reacomodo",
     });
@@ -917,21 +917,53 @@ describe("PACS Dual Monitor (Chromium real + Synapse simulado)", { timeout: 6000
     await page.mouse.move(700, 400);
     await page.mouse.down();
     await page.evaluate(() => window.changeImage());
-    await sleep(2500);
-    assert.equal(await imageFits(page), false, "no se toca mientras usas el visor");
+    await sleep(2000);
+    assert.equal(await imageFits(page), false, "no se toca mientras arrastras");
     await page.mouse.up();
-    await waitFor(() => imageFits(page), { timeout: 6000, what: "reacomodada al soltar" });
-    // Un panel (imagen más chica a propósito): un intento y se acepta, sin insistir.
+    await waitFor(() => imageFits(page), { timeout: 3000, what: "reacomodada al soltar" });
+    // Un panel (imagen más chica a propósito, también tras el aviso): un solo
+    // aviso y queda así, sin insistir.
     await page.evaluate(() => window.togglePanel());
-    await waitFor(async () => /al reacomodarla no cambia: se deja así/.test(await logText()), { timeout: 15000, what: "panel aceptado" });
+    await sleep(2500);
+    assert.deepEqual(await page.evaluate(() => window.__viewer.layout.w), await page.evaluate(() => Math.round(innerWidth * 0.6)));
     const n1 = await synthResizes(page);
-    await sleep(4000);
+    await sleep(3000);
     assert.equal(await synthResizes(page), n1, "no insiste con un layout que Synapse quiere así");
-    // Con el botón se vuelve a revisar todo (y se registra el antes/después).
-    await page.evaluate(() => window.togglePanel());
-    const r = await swEval(() => repositionViewerNow("prueba"));
-    assert.equal(r.ok, true);
-    await waitFor(async () => /Botón: cómo estaba el visor antes y cómo quedó/.test(await logText()), { timeout: 4000, what: "registro del botón" });
+  });
+
+  it("Z7) la imagen queda 10 px más corta al poner una imagen nueva (como en el equipo real): se corrige sola aunque muevas el mouse", async () => {
+    await worklist.evaluate(() => window.openStudy("Z7", "popup", "layoutBug=short"));
+    const page = await waitViewer("Z7");
+    await sleep(2500);
+    for (let i = 0; i < 3; i++) {
+      await page.evaluate(() => window.changeImage());
+      assert.equal(await imageFits(page), false, "el visor simulado reproduce el problema");
+      // El mouse se mueve todo el tiempo (leyendo la imagen).
+      const t0 = Date.now();
+      let fixed = false;
+      while (Date.now() - t0 < 3000 && !fixed) {
+        await page.mouse.move(600 + ((Date.now() / 10) % 300), 500 + i * 20);
+        fixed = await imageFits(page);
+        await sleep(100);
+      }
+      assert.ok(fixed, `imagen corregida (vez ${i + 1}) sin dejar de mover el mouse`);
+      await sleep(800);
+    }
+    await waitFor(async () => /Synapse acomodó las imágenes con otro tamaño[^\n]*\(vez n\.º 3\)/.test(await logText()), {
+      timeout: 3000,
+      what: "registro de las 3 correcciones",
+    });
+  });
+
+  it("Z8) cambia el tamaño de UNA imagen sin cambiar el contorno total: también se corrige", async () => {
+    await worklist.evaluate(() => window.openStudy("Z8", "popup", "layoutBug=inner"));
+    const page = await waitViewer("Z8");
+    await sleep(2500);
+    const vp2Fits = () => page.evaluate(() => window.__viewer.vp2 && window.__viewer.vp2.h === Math.round(innerHeight * 0.4));
+    await waitFor(vp2Fits, { timeout: 3000, what: "segundo visor bien al abrir" });
+    await page.evaluate(() => window.changeImage());
+    assert.equal(await vp2Fits(), false);
+    await waitFor(vp2Fits, { timeout: 3000, what: "segundo visor corregido" });
   });
 
   it("Z3) cambiar imágenes muy seguido nunca detiene el aviso del tamaño real; solo un bucle real de Synapse lo pausa", async () => {

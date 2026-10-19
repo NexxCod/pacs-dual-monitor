@@ -303,7 +303,6 @@
   const inViewer = TOP_VIEWER;
   let inputAt = 0;
   let inputSentAt = 0;
-  let moveAt = 0; // ultimo movimiento del mouse sobre el visor
   let pointerDown = false; // boton del mouse apretado (arrastrando, midiendo...)
   let afterPointerUp = null; // reacomodo pendiente hasta soltar el mouse
   // Cualquier uso del visor (tambien dentro de iframes) se informa al
@@ -319,10 +318,6 @@
     }
   }
   function noteInput(type) {
-    if (type === "pointermove") {
-      moveAt = Date.now(); // mover el mouse no es "usar" el visor
-      return;
-    }
     inputAt = Date.now();
     reportInput();
     if (type === "pointerdown") pointerDown = true;
@@ -378,17 +373,11 @@
     for (const type of ["pointerdown", "pointerup", "pointercancel"]) {
       window.addEventListener(type, markInput, { capture: true, passive: true });
     }
-    let moveSentAt = 0;
     window.addEventListener(
       "pointermove",
       (e) => {
-        if (!e.isTrusted) return;
         // Boton soltado sin que llegara "pointerup" (p.ej. fuera de la ventana).
-        if (pointerDown && e.buttons === 0) markInput({ isTrusted: true, type: "pointerup" });
-        const now = Date.now();
-        if (now - moveSentAt < 200) return;
-        moveSentAt = now;
-        markInput({ isTrusted: true, type: "pointermove" });
+        if (pointerDown && e.isTrusted && e.buttons === 0) markInput({ isTrusted: true, type: "pointerup" });
       },
       { capture: true, passive: true }
     );
@@ -731,7 +720,7 @@
         hasInput: inputAt > 0,
         blockedCalls,
         media: mediaInfo(),
-        area: imageArea(),
+        area: publicArea(imageArea()),
         relayouts,
         page: readPageStats(),
         visibility: document.visibilityState,
@@ -766,27 +755,29 @@
       fire();
       setTimeout(fire, 300);
       scheduleReport(1500, true);
-      // Con el boton, el usuario indica que algo se ve mal: se vuelve a
-      // revisar todo, aunque antes se hubiera aceptado o pausado.
+      // Lo que Synapse cambie en respuesta a este aviso es lo correcto: el
+      // seguidor de imagenes toma ese estado como base.
+      lay.relayoutAt = Date.now();
+      lay.settleUntil = lay.relayoutAt + 900;
+      lay.sample = null;
+      lay.refresh = true;
       if (manual) {
-        area.accepted.clear();
-        area.tries.clear();
-        area.streak = 0;
-        area.pausedUntil = 0;
+        lay.recent = [];
+        lay.pausedUntil = 0;
       }
     }
 
     // ---------------------------------------------------------------
-    // La imagen dentro de la ventana. Synapse a veces acomoda sus visores
-    // para un tamano que no es el de la ventana (p.ej. el que "recuerda") y
-    // la imagen queda saliendose de la pantalla o mucho mas chica; el boton
-    // de la extension lo arregla porque le avisa el tamano real ("resize").
-    // Aqui se vigila el area que ocupan las imagenes y, si queda fuera de la
-    // ventana (o mucho mas chica) con el visor quieto, se hace lo mismo que el
-    // boton. Si al reacomodar no cambia nada, ese es el layout que Synapse
-    // quiere (p.ej. un panel abierto): se acepta y no se insiste.
+    // Las imagenes dentro de la ventana. Al poner una imagen nueva (o cambiar
+    // la disposicion), Synapse a veces acomoda sus visores con un tamano
+    // equivocado (p.ej. 10 px mas cortos) y solo lo corrige cuando recibe el
+    // aviso "resize", que es justo lo que hace el boton de la extension. Por
+    // eso, CADA VEZ que Synapse cambia el tamano o la posicion de alguna
+    // imagen, se hace lo mismo que el boton: una vez, apenas Synapse termino
+    // de acomodar y sin esperar a que dejes de mover el mouse (solo se espera
+    // si estas arrastrando). Si tras el aviso nada cambia, ya estaba bien.
     // ---------------------------------------------------------------
-    const area = { seenSig: "", seenAt: 0, verifying: false, accepted: new Map(), tries: new Map(), streak: 0, lastFixAt: 0, pausedUntil: 0 };
+    const lay = { base: null, seen: "", seenAt: 0, relayoutAt: 0, settleUntil: 0, sample: null, refresh: false, before: null, recent: [], pausedUntil: 0 };
 
     function imageArea() {
       const vw = window.innerWidth;
@@ -803,6 +794,7 @@
       };
       let u = null;
       let n = 0;
+      const rects = [];
       const scan = (doc, offX, offY, clip, depth) => {
         const view = doc.defaultView;
         for (const el of doc.querySelectorAll("canvas, img, video")) {
@@ -824,6 +816,7 @@
           }
           if (!b) continue;
           n++;
+          rects.push([b.l, b.t, b.r, b.b].map(Math.round).join(","));
           u = u ? { l: Math.min(u.l, b.l), t: Math.min(u.t, b.t), r: Math.max(u.r, b.r), b: Math.max(u.b, b.b) } : b;
         }
         if (depth > 3) return;
@@ -853,8 +846,17 @@
         return null;
       }
       if (!u) return null;
-      return { l: Math.round(u.l), t: Math.round(u.t), r: Math.round(u.r), b: Math.round(u.b), n, vw, vh };
+      const sig = vw + "x" + vh + ":" + rects.sort().join(";");
+      return { l: Math.round(u.l), t: Math.round(u.t), r: Math.round(u.r), b: Math.round(u.b), n, vw, vh, sig };
     }
+
+    // Firma corta (para el diagnostico).
+    function shortHash(text) {
+      let h = 0;
+      for (let i = 0; i < text.length; i++) h = (Math.imul(h, 31) + text.charCodeAt(i)) | 0;
+      return (h >>> 0).toString(16);
+    }
+    const publicArea = (u) => (u ? { l: u.l, t: u.t, r: u.r, b: u.b, n: u.n, vw: u.vw, vh: u.vh, firma: shortHash(u.sig) } : null);
 
     function areaProblem(u) {
       const sides = [];
@@ -863,73 +865,96 @@
       if (u.r > u.vw + 2) sides.push("derecha");
       if (u.b > u.vh + 2) sides.push("abajo");
       if (sides.length) return { kind: "fuera", sides };
-      if (u.r < 0.75 * u.vw || u.b < 0.75 * u.vh) return { kind: "chica" };
       return null;
     }
 
-    const sigOf = (u) => [u.l, u.t, u.r, u.b, u.vw, u.vh].join(",");
+    // Firma barata de donde estan las imagenes (solo posiciones y tamanos;
+    // se mide 4 veces por segundo, asi que sin estilos ni recortes).
+    function fastSig() {
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const min = 0.01 * vw * vh;
+      const out = [];
+      const scan = (doc, ox, oy, depth) => {
+        for (const el of doc.querySelectorAll("canvas, img, video")) {
+          const r = el.getBoundingClientRect();
+          if (r.width * r.height < min) continue;
+          out.push([r.left + ox, r.top + oy, r.right + ox, r.bottom + oy].map(Math.round).join(","));
+        }
+        if (depth > 3) return;
+        for (const f of doc.querySelectorAll("iframe")) {
+          let inner = null;
+          try {
+            inner = f.contentDocument;
+          } catch (e) { /* otro origen */ }
+          if (!inner) continue;
+          const fr = f.getBoundingClientRect();
+          scan(inner, fr.left + ox + f.clientLeft, fr.top + oy + f.clientTop, depth + 1);
+        }
+      };
+      try {
+        scan(document, 0, 0, 0);
+      } catch (e) {
+        return "";
+      }
+      return out.length ? vw + "x" + vh + ":" + out.sort().join(";") : "";
+    }
 
-    function checkArea() {
-      if (!settings.keepInPlace || document.visibilityState !== "visible" || area.verifying) return;
+    function followLayout() {
+      if (!settings.keepInPlace || document.visibilityState !== "visible") return;
+      if (pointerDown) return; // arrastrando o midiendo: al soltar
       const now = Date.now();
-      // Nunca mientras usas el visor (arrastrando, midiendo, recorriendo) ni
-      // mientras mueves el mouse (p.ej. una vista previa que sigue al puntero).
-      if (pointerDown || now - inputAt < 1000 || now - moveAt < 1000) return;
-      const u = imageArea();
-      if (!u) return;
-      const sig = sigOf(u);
-      const problem = areaProblem(u);
-      const acceptedAt = area.accepted.get(sig);
-      if (!problem || (acceptedAt && now - acceptedAt < 180000)) {
-        area.seenSig = "";
-        return;
-      }
-      // Que se quede asi al menos 1 s (Synapse puede estar acomodando).
-      if (sig !== area.seenSig) {
-        area.seenSig = sig;
-        area.seenAt = now;
-        return;
-      }
-      if (now - area.seenAt < 1000 || now < area.pausedUntil || now - area.lastFixAt < 2000) return;
-      // Solo es un "bucle" si vuelve a quedar mal sin que hayas usado el visor
-      // entre un reacomodo y otro; usandolo (cambiando imagenes) nunca se rinde.
-      if (inputAt > area.lastFixAt) area.streak = 0;
-      if (area.streak >= 6) {
-        area.streak = 0;
-        area.pausedUntil = now + 30000;
-        send({ type: "pacs-dm:area-fix", result: "gave-up", from: u, problem });
-        return;
-      }
-      area.streak++;
-      area.lastFixAt = now;
-      area.verifying = true;
-      relayout("imagen");
-      // Resultado del reacomodo, medido en el momento.
-      setTimeout(() => {
-        area.verifying = false;
-        area.seenSig = "";
-        const v = imageArea();
-        if (v && !areaProblem(v)) {
-          area.tries.delete(sig);
-          send({ type: "pacs-dm:area-fix", result: "fixed", from: u, to: v, problem });
+      if (lay.refresh && now < lay.relayoutAt + 450) return;
+      const sig = fastSig();
+      if (lay.refresh) {
+        // Respuesta de Synapse al aviso (medida apenas reacciona): eso es lo
+        // correcto. Lo que cambie DESPUES (otra imagen) se vuelve a corregir.
+        if (lay.sample === null) {
+          lay.sample = { sig, u: lay.before ? imageArea() : null };
           return;
         }
-        if (!v || sigOf(v) !== sig || inputAt >= now) return;
-        // Quedo igual sin que tocaras nada. Una imagen MAS CHICA puede ser a
-        // proposito (un panel abierto): tras 2 intentos se acepta un rato. Una
-        // imagen que se SALE de la ventana nunca se acepta.
-        if (problem.kind === "chica") {
-          const t = (area.tries.get(sig) || 0) + 1;
-          area.tries.set(sig, t);
-          if (t >= 2) {
-            area.tries.delete(sig);
-            area.accepted.set(sig, Date.now());
-            send({ type: "pacs-dm:area-fix", result: "accepted", from: u, problem });
-          }
+        if (now < lay.settleUntil) return;
+        lay.refresh = false;
+        const ok = lay.sample;
+        if (lay.before && ok.sig && ok.sig !== lay.before.sig) {
+          send({ type: "pacs-dm:area-fix", result: "fixed", from: publicArea(lay.before.u), to: publicArea(ok.u) });
         }
-      }, 1500);
+        lay.before = null;
+        lay.seen = "";
+        // Si usaste el visor mientras tanto (p.ej. pusiste otra imagen), se
+        // revisa de nuevo en vez de dar por bueno lo que haya.
+        lay.base = inputAt > lay.relayoutAt ? "\u0000" : ok.sig;
+        return;
+      }
+      if (lay.base === null || !sig) {
+        lay.base = sig; // primera vez, o sin imagenes (cargando)
+        return;
+      }
+      if (sig === lay.base) {
+        lay.seen = "";
+        return;
+      }
+      // Synapse cambio alguna imagen: esperar a que termine de acomodar.
+      if (sig !== lay.seen) {
+        lay.seen = sig;
+        lay.seenAt = now;
+        return;
+      }
+      if (now - lay.seenAt < 400 || now < lay.pausedUntil) return;
+      // Bucle (cambia sola una y otra vez sin que uses el visor): pausa corta.
+      lay.recent = lay.recent.filter((t) => now - t < 15000 && t > inputAt);
+      if (lay.recent.length >= 6) {
+        lay.recent = [];
+        lay.pausedUntil = now + 15000;
+        lay.base = sig;
+        send({ type: "pacs-dm:area-fix", result: "gave-up", from: publicArea(imageArea()) });
+        return;
+      }
+      lay.recent.push(now);
+      lay.before = { sig, u: imageArea() };
+      relayout("imagen");
     }
-    setInterval(checkArea, 1000);
+    setInterval(followLayout, 250);
     // Cada 3 s el background confirma que la ventana sigue donde la dejo el
     // boton (por si Chrome no aviso de algun cambio).
     setInterval(() => {
@@ -942,7 +967,7 @@
       return {
         ventana: { x: window.screenX, y: window.screenY, w: window.outerWidth, h: window.outerHeight },
         pagina: { w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio, scroll: [window.scrollX, window.scrollY] },
-        imagen: u,
+        imagen: publicArea(u),
         problema: u ? areaProblem(u) : null,
       };
     }

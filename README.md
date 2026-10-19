@@ -9,7 +9,15 @@ Se instala una vez y funciona sola. No cambia tu flujo de trabajo.
 
 ---
 
-## Novedad de la versión 2.0.4: el visor no se suelta mientras lo usas
+## Novedad de la versión 2.0.5: ya no hay que apretar el botón al poner una imagen nueva
+
+Con el diagnóstico de un equipo real (dos monitores verticales) se vio exactamente qué pasaba: la ventana del visor quedaba bien, pero **al poner una imagen nueva Synapse acomodaba las imágenes con otro tamaño** (por ejemplo, 10 px más cortas) y solo las corregía cuando recibía el aviso de "cambio de tamaño" que manda el botón de la extensión.
+
+Ahora la extensión hace lo mismo que el botón **cada vez que Synapse cambia el tamaño o la posición de cualquier imagen**: apenas Synapse termina de acomodarla (menos de un segundo), sin esperar a que dejes de mover el mouse. Solo espera si estás arrastrando o midiendo (lo hace al soltar). Si después del aviso nada cambia, es que ya estaba bien (por ejemplo, un panel abierto) y no insiste.
+
+---
+
+## Versión 2.0.4: el visor no se suelta mientras lo usas
 
 El visor debe quedar siempre como lo deja el botón de reubicar. Las versiones anteriores tenían "frenos" para no pelear sin fin con otro programa; usando el visor normalmente (por ejemplo, cambiando imágenes seguido) esos frenos podían activarse y dejar el visor mal hasta apretar el botón, que los reiniciaba. Ahora:
 
